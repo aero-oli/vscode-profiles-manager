@@ -1,0 +1,4 @@
+# Optional metadata for OpenAI/Codex skill hosts.
+# Keep dependencies minimal: helper scripts use Python standard library only.
+dependencies:
+  - python>=3.9
