@@ -10,15 +10,15 @@
     "variant": {"type": "string", "enum": ["code", "insiders", "codium", "custom"], "default": "code"},
     "codeBin": {"type": "string", "description": "Override the VS Code CLI binary/path."},
     "workspace": {"type": "string", "description": "Folder/workspace to open when creating or activating the profile."},
-    "profileId": {"type": "string", "description": "Internal profile ID/folder name, if known."},
-    "settingsFile": {"type": "string", "description": "Explicit settings.json path, if known."},
-    "settings": {"type": "object", "additionalProperties": true},
-    "removeSettings": {"type": "array", "items": {"type": "string"}},
+    "profileId": {"type": "string", "description": "Internal profile ID/folder name from list-profiles. Required for profile-file writes unless settingsFile is provided."},
+    "settingsFile": {"type": "string", "description": "Explicit profile settings.json path. Can be used instead of profileId for profile-file writes."},
+    "settings": {"type": "object", "additionalProperties": true, "description": "Profile settings to merge. Requires profileId or settingsFile when applying."},
+    "removeSettings": {"type": "array", "items": {"type": "string"}, "description": "Top-level profile setting keys to remove. Requires profileId or settingsFile when applying."},
     "extensions": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
     "removeExtensions": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
-    "keybindings": {"type": "array", "items": {"type": "object"}},
-    "snippets": {"type": "object", "additionalProperties": true},
-    "tasks": {"type": "object", "additionalProperties": true},
+    "keybindings": {"type": "array", "items": {"type": "object"}, "description": "Complete keybindings.json content. Requires profileId or settingsFile when applying."},
+    "snippets": {"type": "object", "additionalProperties": {"type": "object"}, "description": "Snippet files keyed by filename, for example python.json or global.code-snippets. Requires profileId or settingsFile when applying."},
+    "tasks": {"type": "object", "additionalProperties": true, "description": "Complete tasks.json content. Requires profileId or settingsFile when applying."},
     "notes": {"type": "string"}
   }
 }

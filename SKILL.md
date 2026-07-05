@@ -84,6 +84,7 @@ Use the helper script when available:
 
 ```bash
 python scripts/vscode_profile_manager.py paths --variant code
+python scripts/vscode_profile_manager.py list-profiles --variant code
 ```
 
 For Insiders:
@@ -102,6 +103,8 @@ Manually check likely locations:
 - Linux Insiders: `~/.config/Code - Insiders/User`
 
 Named profile files are stored under the `profiles` directory inside the relevant User directory. The profile ID is not always the same as the profile display name.
+
+Use `list-profiles` before editing an existing named profile. It reports known profile IDs, display names when available, and the concrete `settings.json`, `keybindings.json`, `tasks.json`, and snippets paths. If the target profile name still cannot be mapped to an ID, ask the user to open that profile's Settings JSON from VS Code and use the opened file path as `settingsFile`.
 
 ### 3. Back up before mutation
 
@@ -160,7 +163,7 @@ For JSON arrays like `keybindings.json`, edit manually or with a small script th
 
 ### 7. Maintain profile manifests
 
-For repeatable profile setup, keep a manifest in version control or in a personal dotfiles folder. Use this structure:
+For repeatable profile setup, keep a manifest in version control or in a personal dotfiles folder. Use this structure for command generation and audit:
 
 ```json
 {
@@ -181,6 +184,13 @@ For repeatable profile setup, keep a manifest in version control or in a persona
 ```
 
 Use manifests to reconstruct or audit profiles rather than relying on undocumented VS Code state.
+
+To apply profile file changes from a manifest, include either:
+
+- `profileId`: internal folder name from `list-profiles`
+- `settingsFile`: exact path opened from VS Code's profile Settings JSON command
+
+Without one of those targets, `apply-spec` must stop before creating/opening VS Code or installing extensions. Manifest fields for `settings`, `removeSettings`, `keybindings`, `tasks`, and `snippets` are profile-file changes and require a target.
 
 ### 8. Audit and repair
 
@@ -241,7 +251,7 @@ Use Profiles editor → New Profile dropdown → Import Profile. Import from a l
 
 This skill includes:
 
-- `scripts/vscode_profile_manager.py`: safe helper for path discovery, backups, JSONC validation, settings merges, extension listing/installation/uninstallation, and profile snapshots.
+- `scripts/vscode_profile_manager.py`: safe helper for path/profile discovery, backups, JSONC validation, settings/profile-file writes, extension listing/installation/uninstallation, manifest dry-runs, and profile snapshots.
 - `assets/example-profile-spec.json`: example manifest for repeatable profile setup.
 - `assets/profile-spec.schema.json`: schema for profile manifests.
 - `references/vscode-profiles-research.md`: grounded notes on VS Code profile behaviour and source links.

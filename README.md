@@ -37,6 +37,12 @@ Show likely VS Code profile paths:
 python ~/.agents/skills/vscode-profiles-manager/scripts/vscode_profile_manager.py paths --variant code
 ```
 
+List known profile IDs and profile file paths:
+
+```bash
+python ~/.agents/skills/vscode-profiles-manager/scripts/vscode_profile_manager.py list-profiles --variant code
+```
+
 Back up stable VS Code profile/user config:
 
 ```bash
@@ -53,6 +59,12 @@ Generate setup commands from a manifest:
 
 ```bash
 python ~/.agents/skills/vscode-profiles-manager/scripts/vscode_profile_manager.py generate-commands --spec ~/Desktop/python-vscode-profile.json
+```
+
+Apply a manifest after adding `profileId` or `settingsFile` for profile-file changes:
+
+```bash
+python ~/.agents/skills/vscode-profiles-manager/scripts/vscode_profile_manager.py apply-spec --spec ~/Desktop/python-vscode-profile.json --dry-run
 ```
 
 List extensions in a profile:

@@ -29,9 +29,10 @@ Last reviewed: 2026-07-05
 
 1. **Prefer official surfaces.** Use `code --profile`, profile export/import, and extension CLI operations before touching files directly.
 2. **Use manifests for maintainability.** A simple manifest of profile name, extensions, settings, and notes is easier to audit and recreate than internal VS Code state.
-3. **Do not assume display name == profile ID.** Profile folders use internal IDs. Ask the user to open profile settings JSON or inspect profile folders when you need the exact file path.
+3. **Do not assume display name == profile ID.** Profile folders use internal IDs. Use the helper's `list-profiles` command first. If it cannot map the display name, ask the user to open profile settings JSON and use that exact file path.
 4. **Avoid internal stores.** `state.vscdb`, `storage.json`, global storage, and workspace storage are implementation details. Edit them only as a last-resort repair with VS Code closed and a backup.
 5. **Separate profiles from full isolation.** Profiles are good for editor customisations. Use `--user-data-dir` for fully isolated app state or different inherited environment variables.
+6. **Preflight manifest writes.** Any manifest operation that writes `settings`, `removeSettings`, `keybindings`, `tasks`, or `snippets` must know either the internal `profileId` or an explicit `settingsFile` before opening VS Code or changing extensions.
 
 ## Sources
 

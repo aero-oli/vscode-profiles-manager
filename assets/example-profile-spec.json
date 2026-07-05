@@ -17,5 +17,5 @@
       "editor.defaultFormatter": "charliermarsh.ruff"
     }
   },
-  "notes": "Example repeatable Python profile manifest. Use uv/project venv settings at workspace level rather than hard-coding machine-specific interpreter paths into the profile."
+  "notes": "Example repeatable Python profile manifest. Add profileId from list-profiles or settingsFile before apply-spec writes settings. Use uv/project venv settings at workspace level rather than hard-coding machine-specific interpreter paths into the profile."
 }
