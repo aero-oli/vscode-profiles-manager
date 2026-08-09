@@ -10,15 +10,18 @@
     "variant": {"type": "string", "enum": ["code", "insiders", "codium", "custom"], "default": "code"},
     "codeBin": {"type": "string", "description": "Override the VS Code CLI binary/path."},
     "workspace": {"type": "string", "description": "Folder/workspace to open when creating or activating the profile."},
-    "profileId": {"type": "string", "description": "Internal profile ID/folder name from list-profiles. Required for profile-file writes unless settingsFile is provided."},
+    "profileId": {"type": "string", "minLength": 1, "pattern": "^[^/\\\\]+$", "not": {"enum": [".", ".."]}, "description": "One internal profile folder name from list-profiles, never a path. Required for profile-file writes unless settingsFile is provided."},
     "settingsFile": {"type": "string", "description": "Explicit profile settings.json path. Can be used instead of profileId for profile-file writes."},
     "settings": {"type": "object", "additionalProperties": true, "description": "Profile settings to merge. Requires profileId or settingsFile when applying."},
-    "removeSettings": {"type": "array", "items": {"type": "string"}, "description": "Top-level profile setting keys to remove. Requires profileId or settingsFile when applying."},
-    "extensions": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
-    "removeExtensions": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "settingsMerge": {"type": "string", "enum": ["replace", "deep"], "default": "replace", "description": "Whether object-valued settings replace their prior value or are recursively merged."},
+    "removeSettings": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true, "description": "Top-level profile setting keys to remove. Requires profileId or settingsFile when applying."},
+    "extensions": {"type": "array", "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*\\.[A-Za-z0-9][A-Za-z0-9_.-]*(?:@[A-Za-z0-9][A-Za-z0-9.+_-]*)?$"}, "uniqueItems": true, "description": "Marketplace extension IDs, optionally pinned with @version. Use the direct install command for VSIX files."},
+    "removeExtensions": {"type": "array", "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*\\.[A-Za-z0-9][A-Za-z0-9_.-]*$"}, "uniqueItems": true, "description": "Marketplace extension IDs to uninstall; applying requires --confirm-destructive."},
     "keybindings": {"type": "array", "items": {"type": "object"}, "description": "Complete keybindings.json content. Requires profileId or settingsFile when applying."},
     "snippets": {"type": "object", "additionalProperties": {"type": "object"}, "description": "Snippet files keyed by filename, for example python.json or global.code-snippets. Requires profileId or settingsFile when applying."},
     "tasks": {"type": "object", "additionalProperties": true, "description": "Complete tasks.json content. Requires profileId or settingsFile when applying."},
+    "mcpServers": {"type": "object", "additionalProperties": {"type": "object"}, "description": "Named MCP server definitions to merge into the profile mcp.json servers object. Prefer env or input variables over literal secrets."},
+    "removeMcpServers": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true, "description": "Named MCP servers to remove; applying requires --confirm-destructive."},
     "notes": {"type": "string"}
   }
 }

@@ -1,84 +1,53 @@
 # VS Code Profiles Manager Skill
 
-A Codex/agent skill for creating, editing, auditing, backing up, restoring, and maintaining Visual Studio Code profiles.
+A standalone Codex/Agent Skill for safe, repeatable Visual Studio Code profile maintenance.
+
+It combines official VS Code profile and extension commands with a standard-library Python helper for discovery, manifests, atomic file edits, backups, restores, dry runs, and recovery.
 
 ## Install
 
-Copy the folder into your agent skills directory:
+Place this directory at `~/.agents/skills/vscode-profiles-manager`, or under a repository's `.agents/skills/` directory. Codex detects skill changes automatically; restart if it does not appear.
+
+## Safety model
+
+- Uses the official `code` CLI for profile creation/selection and extension changes.
+- Never writes VS Code internal databases, UI state, extension state files, or workspace-association stores.
+- Constrains profile IDs and archive members to their intended directories.
+- Verifies profile name/ID mappings when available.
+- Refuses silent JSONC comment loss.
+- Writes configuration atomically.
+- Requires explicit confirmation for removal fields.
+- Creates automatic recovery archives around apply and restore operations.
+- Attempts file and touched-extension rollback when manifest application fails.
+
+Transactional manifests accept Marketplace extension IDs only, optionally pinned with `@version`. Use the direct extension command for an explicitly reviewed VSIX file.
+
+Backups can contain `mcp.json`; treat them as sensitive even though literal secrets should not be stored there.
+
+## Quick checks
 
 ```bash
-mkdir -p ~/.agents/skills && cp -R vscode-profiles-manager ~/.agents/skills/
+python3 scripts/vscode_profile_manager.py doctor --variant code
+python3 scripts/vscode_profile_manager.py list-profiles --variant code
+python3 scripts/vscode_profile_manager.py validate-spec --spec assets/example-profile-spec.json
+python3 scripts/vscode_profile_manager.py apply-spec --spec assets/example-profile-spec.json --dry-run
 ```
 
-If your agent host supports a skills CLI, install/import the folder with that CLI instead.
+The example manifest intentionally has no `profileId`. Add the ID returned by `list-profiles`, or an exact `settingsFile` path opened by VS Code, before applying profile-file changes.
 
-## What is included
-
-```text
-vscode-profiles-manager/
-├── SKILL.md
-├── README.md
-├── agents/
-│   └── openai.yaml
-├── assets/
-│   ├── example-profile-spec.json
-│   └── profile-spec.schema.json
-├── references/
-│   └── vscode-profiles-research.md
-└── scripts/
-    └── vscode_profile_manager.py
-```
-
-## Typical commands
-
-Show likely VS Code profile paths:
+## Backup and restore
 
 ```bash
-python ~/.agents/skills/vscode-profiles-manager/scripts/vscode_profile_manager.py paths --variant code
+python3 scripts/vscode_profile_manager.py backup --profile "Python" --profile-id PROFILE_ID --out ~/Desktop/vscode-profile-backups
+python3 scripts/vscode_profile_manager.py restore --archive /path/to/backup.zip
+python3 scripts/vscode_profile_manager.py restore --archive /path/to/backup.zip --confirm
 ```
 
-List known profile IDs and profile file paths:
+Restore previews by default and does not automatically reconcile installed extensions.
 
-```bash
-python ~/.agents/skills/vscode-profiles-manager/scripts/vscode_profile_manager.py list-profiles --variant code
-```
+## Requirements
 
-Back up stable VS Code profile/user config:
+- Python 3.10+; no third-party Python packages.
+- The matching VS Code CLI for extension operations and profile opening: `code`, `code-insiders`, `codium`, or `--code-bin`.
 
-```bash
-python ~/.agents/skills/vscode-profiles-manager/scripts/vscode_profile_manager.py backup --variant code --out ~/Desktop/vscode-profile-backups
-```
-
-Create a manifest skeleton:
-
-```bash
-python ~/.agents/skills/vscode-profiles-manager/scripts/vscode_profile_manager.py scaffold-spec --profile "Python" --out ~/Desktop/python-vscode-profile.json
-```
-
-Generate setup commands from a manifest:
-
-```bash
-python ~/.agents/skills/vscode-profiles-manager/scripts/vscode_profile_manager.py generate-commands --spec ~/Desktop/python-vscode-profile.json
-```
-
-Apply a manifest after adding `profileId` or `settingsFile` for profile-file changes:
-
-```bash
-python ~/.agents/skills/vscode-profiles-manager/scripts/vscode_profile_manager.py apply-spec --spec ~/Desktop/python-vscode-profile.json --dry-run
-```
-
-List extensions in a profile:
-
-```bash
-python ~/.agents/skills/vscode-profiles-manager/scripts/vscode_profile_manager.py list-extensions --profile "Python" --show-versions
-```
-
-Merge profile settings safely once you know the target `settings.json` path:
-
-```bash
-python ~/.agents/skills/vscode-profiles-manager/scripts/vscode_profile_manager.py merge-settings --file "/path/to/settings.json" --set-json '{"editor.formatOnSave":true}'
-```
-
-## Safety stance
-
-The skill deliberately avoids direct edits to undocumented VS Code state stores unless explicitly requested. It uses official VS Code CLI/profile export behaviours where possible, and backs up JSON files before editing.
+Use `--user-dir` for file-only work on an exact custom/portable User directory. Use `--user-data-dir` for an isolated VS Code instance root when profile or extension CLI operations are also required.

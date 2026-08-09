@@ -1,44 +1,58 @@
-# VS Code Profiles Research Notes
+# VS Code Profiles Reference
 
-Last reviewed: 2026-07-05
+Last verified against online documentation: 2026-08-09
 
-## Official VS Code behaviour
+## Official behavior
 
-- VS Code Profiles are used to create sets of customisations and switch/share them.
-- Profiles are managed primarily through the Profiles editor.
-- A new profile can be created from a template, from an existing profile, or as an empty profile.
-- Profile contents can include settings, keyboard shortcuts, MCP servers, snippets, tasks, extensions, and UI layout/configuration.
-- Profiles are associated with folders/workspaces after selection, so reopening a workspace can reactivate its associated profile.
-- Profiles can be switched via the Command Palette or Profiles editor.
-- Settings and extensions can be applied to all profiles through VS Code UI actions.
-- Settings Sync can sync profiles across machines when Profiles is enabled in Settings Sync, but extensions are not synced to/from remote windows such as SSH, Dev Containers, or WSL.
-- Profiles can be exported to a GitHub gist or a local `.code-profile` file, and imported from either.
-- The CLI can open a workspace with `--profile "Profile Name"`; if the profile does not exist, VS Code creates an empty profile with that name.
-- The CLI supports `--install-extension`, `--uninstall-extension`, and `--list-extensions` with `--profile`.
-- VS Code user settings are JSON files. Profile settings live under a profile-ID folder inside the User `profiles` directory, and are only created when profile-specific settings exist.
-- Profiles are stored under the User configuration directory:
-  - Windows: `%APPDATA%\Code\User\profiles`
-  - macOS: `$HOME/Library/Application Support/Code/User/profiles`
-  - Linux: `$HOME/.config/Code/User/profiles`
-  - Insiders uses `Code - Insiders` as the intermediate application folder.
-- VS Code does not currently support live inheritance between profiles. Creating a profile from another profile copies settings but does not keep them linked.
-- Machine-specific settings are not exported in profile exports.
-- To isolate environment variables between VS Code instances, use `--user-data-dir`; this creates separate environment, settings, installed extensions, UI state and layout. Extensions must be installed separately for each user data directory.
+- The Default Profile is the current normal user configuration.
+- Named profiles can contain settings, keyboard shortcuts, snippets, tasks, extensions, MCP servers, and UI state/layout.
+- When creating a profile, users can copy an existing profile/template or create an Empty Profile.
+- A partial profile can omit entire configuration categories and use those categories live from the Default Profile.
+- VS Code cannot inherit individual settings from another profile. Copying settings creates an independent copy with no live link.
+- Selecting or creating a profile associates it with the current folder/workspace. Reopening that workspace activates its associated profile.
+- `Developer: Reset Workspace Profiles Associations` resets associations without deleting profiles.
+- Settings and extensions can be applied to all profiles through native UI actions.
+- Temporary Profiles start empty and disappear after the VS Code session ends.
+- Settings Sync supports settings, keyboard shortcuts, snippets, tasks, UI state, extensions, profiles, and MCP configuration. Extensions do not sync to or from remote SSH, Dev Container, or WSL windows.
+- Profiles export to a local `.code-profile` file or an unlisted GitHub gist and import through the Profiles editor. Machine-scoped settings are excluded.
+- `code <workspace> --profile <name>` opens the workspace with that profile and creates an Empty Profile if the name does not exist.
+- `--profile` works with `--install-extension`, `--uninstall-extension`, and `--list-extensions`.
+- `--user-data-dir` creates an isolated instance with separate environment variables, settings, extensions, and UI state.
+- Named profile settings live at `User/profiles/<profile ID>/settings.json`; the file appears only after that profile overrides a setting.
 
-## Practical implications for agents
+## MCP boundaries
 
-1. **Prefer official surfaces.** Use `code --profile`, profile export/import, and extension CLI operations before touching files directly.
-2. **Use manifests for maintainability.** A simple manifest of profile name, extensions, settings, and notes is easier to audit and recreate than internal VS Code state.
-3. **Do not assume display name == profile ID.** Profile folders use internal IDs. Use the helper's `list-profiles` command first. If it cannot map the display name, ask the user to open profile settings JSON and use that exact file path.
-4. **Avoid internal stores.** `state.vscdb`, `storage.json`, global storage, and workspace storage are implementation details. Edit them only as a last-resort repair with VS Code closed and a backup.
-5. **Separate profiles from full isolation.** Profiles are good for editor customisations. Use `--user-data-dir` for fully isolated app state or different inherited environment variables.
-6. **Preflight manifest writes.** Any manifest operation that writes `settings`, `removeSettings`, `keybindings`, `tasks`, or `snippets` must know either the internal `profileId` or an explicit `settingsFile` before opening VS Code or changing extensions.
+- User-profile MCP configuration is stored in that profile's `mcp.json`; workspace configuration is `.vscode/mcp.json`.
+- Prefer `${env:...}` or `${input:...}` instead of literal API keys or passwords.
+- MCP servers can execute arbitrary local code. Adding configuration must not imply trusting or starting the server.
+- Starting a server directly from `mcp.json` can bypass the normal trust prompt, so use the MCP management UI for review and trust decisions.
+- MCP enable/disable state is stored separately from `mcp.json`; a file-only backup cannot promise to restore it.
 
-## Sources
+## Helper design consequences
 
-- VS Code Profiles documentation: https://code.visualstudio.com/docs/configure/profiles
-- VS Code Settings documentation: https://code.visualstudio.com/docs/configure/settings
-- VS Code CLI documentation: https://code.visualstudio.com/docs/configure/command-line
-- VS Code Extensions documentation: https://code.visualstudio.com/docs/configure/extensions/extension-marketplace
-- VS Code Terminal advanced documentation: https://code.visualstudio.com/docs/terminal/advanced
-- OpenAI Codex skills documentation: https://developers.openai.com/codex/skills
+1. Treat the name-to-ID mapping read from `User/sync/profiles/lastSyncprofiles.json` as best-effort, read-only discovery because it is not a documented public interface.
+2. Require a direct-child profile ID or exact Settings JSON path, resolve and contain every target, and compare discovered display name to manifest name.
+3. Back up only documented JSON/JSONC configuration and snippets. Do not restore internal databases, extension state files, workspace associations, global storage, or UI state.
+4. Capture extension versions with the official CLI as recovery evidence; use the CLI to change extensions.
+5. Make creation/association an explicit `open-profile` action. Routine manifest application must not open a GUI or silently associate a workspace.
+6. Refuse silent comment loss. Structured stdlib JSON writes cannot preserve JSONC comments, so require a targeted edit or explicit approval.
+7. Restore archives defensively: require a helper manifest, reject traversal and symlinks, limit sizes, preview first, back up current files, and write atomically.
+
+## Existing alternatives
+
+- Native VS Code Profiles and Settings Sync are the primary interactive solution.
+- Nix Home Manager offers declarative `programs.vscode.profiles.<name>` settings, extensions, keybindings, snippets, tasks, and MCP configuration for Nix-managed systems.
+- Dev Containers are a better fit for repository-controlled runtimes and remote extension installation.
+- Extension Profiles 3000 is complementary when multiple composable extension groups per workspace are more useful than a single native profile.
+- Microsoft's `jsonc-parser` package is the preferred optional foundation if this helper later adopts comment-preserving targeted edits.
+
+## Primary sources
+
+- VS Code Profiles: https://code.visualstudio.com/docs/configure/profiles
+- VS Code Settings: https://code.visualstudio.com/docs/configure/settings
+- VS Code CLI: https://code.visualstudio.com/docs/configure/command-line
+- VS Code Settings Sync: https://code.visualstudio.com/docs/configure/settings-sync
+- VS Code MCP servers: https://code.visualstudio.com/docs/agent-customization/mcp-servers
+- VS Code Dev Containers: https://code.visualstudio.com/docs/devcontainers/create-dev-container
+- Home Manager VS Code options: https://home-manager.dev/manual/unstable/options/home-manager/programs/vscode.html
+- Microsoft JSONC parser: https://github.com/microsoft/node-jsonc-parser

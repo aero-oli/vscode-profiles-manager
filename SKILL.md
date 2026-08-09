@@ -1,99 +1,57 @@
 ---
 name: vscode-profiles-manager
-description: Use when the user wants to create, edit, audit, export, import, backup, restore, or maintain Visual Studio Code / VS Code Insiders profiles, profile-specific settings, keybindings, snippets, tasks, MCP server configuration, extensions, profile manifests, or workspace/profile associations across macOS, Windows, Linux, or portable/user-data-dir installs.
+description: Safely create, inspect, audit, back up, restore, and maintain Visual Studio Code, VS Code Insiders, or VSCodium profiles. Use for profile-specific settings, extensions, keybindings, snippets, tasks, MCP configuration, repeatable manifests, workspace associations, Settings Sync/export guidance, or isolated user-data-dir instances on macOS, Windows, and Linux.
 ---
 
 # VS Code Profiles Manager
 
-Use this skill to help a user manage VS Code profiles safely and repeatably.
+Manage profiles through official VS Code surfaces first, and use the bundled helper for deterministic discovery, backups, validation, manifests, and recoverable file changes.
 
-## Core model
+## Model and boundaries
 
-VS Code profiles are sets of customisations used to switch editor configuration by workflow, project, demo, language, troubleshooting case, or machine. A profile can include settings, extensions, keyboard shortcuts, snippets, tasks, MCP servers, and UI layout state. The Default Profile is the normal user configuration; named profiles override selected parts of it.
+- The Default Profile contains normal user configuration.
+- A named profile can contain settings, extensions, keyboard shortcuts, snippets, tasks, MCP servers, and UI state.
+- A partial profile can inherit entire omitted configuration categories from the Default Profile. Copied settings are not live-linked, and VS Code does not support per-setting inheritance from another profile.
+- Workspace and workspace-folder settings override user/profile settings according to normal VS Code precedence.
+- Selecting or opening a profile for a folder associates that folder with the profile.
+- Use `--user-data-dir` when separate environment variables, settings, extensions, and UI state are required. A normal profile is not a fully isolated instance.
 
-Treat profiles as a layered system:
+Never directly edit `state.vscdb`, `storage.json`, `globalStorage`, `workspaceStorage`, `extensions.json`, UI state, or workspace-association internals. Use the Profiles editor, Settings Sync, Command Palette, and `code` CLI for those resources.
 
-1. **Application / default user settings**: normal VS Code user configuration.
-2. **Named profile settings**: profile-specific files under the VS Code User profiles directory.
-3. **Workspace settings**: `.vscode/settings.json` or `.code-workspace` settings that override user/profile settings for a project.
-4. **Extension state and UI state**: partly managed by VS Code internals; do not casually edit internal databases.
+## Safety rules
 
-## High-level rules
+1. Inspect and resolve the exact variant, User directory, profile display name, and profile ID before writing.
+2. Run `validate-spec` and `apply-spec --dry-run` before applying a manifest.
+3. Let `apply-spec` create its automatic recovery archive. Do not bypass profile identity checks unless an exact Settings JSON path opened by VS Code proves the target.
+4. Require explicit user intent and `--confirm-destructive` for extension, setting, or MCP removals.
+5. The helper refuses to rewrite commented JSONC by default because a structured rewrite would remove comments. Prefer VS Code or a targeted patch. Use `--allow-comment-loss` only after showing the dry-run diff and receiving explicit approval.
+6. Close VS Code before a multi-file restore. Preview `restore` before passing `--confirm`.
+7. Treat backups and snapshots as potentially sensitive. `mcp.json` can contain credentials; prefer `${env:...}` or `${input:...}` variables and do not publish backup archives or secret gists.
+8. Never start or trust a newly added MCP server on the user's behalf. Review it in VS Code and let the user accept the trust prompt.
 
-- Prefer official VS Code mechanisms first: Profiles editor, `.code-profile` import/export, and the `code` CLI.
-- Use direct file edits only for JSON/JSONC configuration files such as `settings.json`, `keybindings.json`, snippets, tasks, and workspace recommendations.
-- Always make a timestamped backup before editing profile files.
-- Validate JSON/JSONC after editing.
-- Do not edit `state.vscdb`, `storage.json`, workspace storage, global storage, or profile/workspace association internals unless the user explicitly asks for a low-level repair and accepts that VS Code must be closed first.
-- Do not delete profiles, uninstall extensions, or clear settings unless the user has explicitly asked for that destructive action.
-- When the user wants inheritance, explain that VS Code can copy from another profile, but copied profiles are not live-linked to the source profile.
-- When the user wants cross-machine portability, prefer profile export/import or Settings Sync. Warn that remote windows such as SSH, Dev Containers, and WSL have extension sync limitations.
-- For isolated environment variables between VS Code instances, use separate `--user-data-dir` instances rather than normal profiles.
+## Choose the Python launcher
 
-## Useful official commands
+Use `python3` on macOS/Linux. On Windows, use `py -3` or `python` according to the installed launcher. The examples below use `python3`.
 
-Create/open a profile:
-
-```bash
-code ~/some/workspace --profile "Profile Name"
-```
-
-If the named profile does not exist, VS Code creates an empty profile with that name.
-
-Install an extension into a named profile:
+Set a short shell variable only when it improves repeated commands:
 
 ```bash
-code --install-extension publisher.extension --profile "Profile Name"
+python3 scripts/vscode_profile_manager.py doctor --variant code
 ```
 
-Uninstall an extension from a named profile:
+The helper uses only Python's standard library. Profile extension operations additionally require the official VS Code CLI (`code`, `code-insiders`, or `codium`) on `PATH`, or an explicit `--code-bin`.
+
+## Inspect first
+
+Run read-only preflight and discovery:
 
 ```bash
-code --uninstall-extension publisher.extension --profile "Profile Name"
+python3 scripts/vscode_profile_manager.py doctor --variant code
+python3 scripts/vscode_profile_manager.py paths --variant code
+python3 scripts/vscode_profile_manager.py list-profiles --variant code
 ```
 
-List extensions in a named profile:
-
-```bash
-code --list-extensions --show-versions --profile "Profile Name"
-```
-
-Launch fully isolated VS Code state, extensions, environment, and UI:
-
-```bash
-code ~/some/workspace --user-data-dir ~/.vscode-data/some-isolated-profile
-```
-
-## Standard workflow
-
-### 1. Clarify the target outcome only if necessary
-
-Resolve these details from the user request or existing context:
-
-- VS Code stable, Insiders, VSCodium, or a custom portable build.
-- Profile name.
-- Whether this is a new profile, edit to an existing profile, audit, backup, restore, migration, or cleanup.
-- Whether changes should apply only to a profile, all profiles, or a workspace.
-- Desired extension set and settings.
-
-If the requested action is safe and specific enough, proceed without extra questioning.
-
-### 2. Inspect the environment
-
-Use the helper script when available:
-
-```bash
-python scripts/vscode_profile_manager.py paths --variant code
-python scripts/vscode_profile_manager.py list-profiles --variant code
-```
-
-For Insiders:
-
-```bash
-python scripts/vscode_profile_manager.py paths --variant insiders
-```
-
-Manually check likely locations:
+Important locations:
 
 - macOS stable: `~/Library/Application Support/Code/User`
 - macOS Insiders: `~/Library/Application Support/Code - Insiders/User`
@@ -102,163 +60,135 @@ Manually check likely locations:
 - Linux stable: `~/.config/Code/User`
 - Linux Insiders: `~/.config/Code - Insiders/User`
 
-Named profile files are stored under the `profiles` directory inside the relevant User directory. The profile ID is not always the same as the profile display name.
+Use `--user-dir` for file-only inspection, backup, restore, or edits of an exact custom/portable User folder. The VS Code CLI has no matching `--user-dir` option, so the helper rejects CLI-scoped actions for a non-default custom User folder and skips misleading extension snapshots. Use `--user-data-dir` for an isolated-instance root; the helper uses its `User` child and passes the same option to the CLI.
 
-Use `list-profiles` before editing an existing named profile. It reports known profile IDs, display names when available, and the concrete `settings.json`, `keybindings.json`, `tasks.json`, and snippets paths. If the target profile name still cannot be mapped to an ID, ask the user to open that profile's Settings JSON from VS Code and use the opened file path as `settingsFile`.
+`list-profiles` maps names from a best-effort, read-only Settings Sync cache. Profile folder IDs are internal and need not equal display names. If a name cannot be verified, open that profile's Settings JSON in VS Code and use the exact path as `settingsFile` in the manifest.
 
-### 3. Back up before mutation
+## Create, open, and associate profiles
 
-Before any file edit:
-
-```bash
-python scripts/vscode_profile_manager.py backup --variant code --out ~/Desktop/vscode-profile-backups
-```
-
-For one profile folder when the profile ID is known:
+Preview, then open a workspace with a profile through the official CLI:
 
 ```bash
-python scripts/vscode_profile_manager.py backup --variant code --profile-id PROFILE_ID --out ~/Desktop/vscode-profile-backups
+python3 scripts/vscode_profile_manager.py open-profile --profile "Python" --workspace ~/projects/example --dry-run
+python3 scripts/vscode_profile_manager.py open-profile --profile "Python" --workspace ~/projects/example
 ```
 
-### 4. Create or open the profile
+If the profile does not exist, VS Code creates an Empty Profile. Opening the folder with the profile associates them. `apply-spec` deliberately does not create a profile, open a GUI, or change workspace associations.
 
-Use the CLI:
+Use the Profiles editor for profile renaming, icons, content categories, previews, deletion, **Use for New Windows**, and viewing associations. Use `Developer: Reset Workspace Profiles Associations` to reset all associations without deleting profiles.
+
+For shared settings or extensions, prefer VS Code's **Apply Setting to all Profiles** and **Apply Extension to all Profiles** actions.
+
+## Back up and restore
+
+Back up one verified profile, including safe JSON/JSONC files, snippets, and an extension snapshot:
 
 ```bash
-code ~/some/workspace --profile "Profile Name"
+python3 scripts/vscode_profile_manager.py backup --variant code --profile "Python" --profile-id PROFILE_ID --out ~/Desktop/vscode-profile-backups
 ```
 
-If no workspace is specified, create/use a temporary empty folder so the command is deterministic. Avoid assuming the last active workspace is suitable.
+Omit `--profile-id` for Default Profile configuration plus all named-profile safe files. Backups intentionally exclude VS Code internal databases and state files. Archives are created with owner-only permissions and unique timestamps.
 
-### 5. Manage extensions by profile
-
-Install from an explicit list:
+Preview a restore:
 
 ```bash
-code --install-extension ms-python.python --profile "Python"
-code --install-extension charliermarsh.ruff --profile "Python"
+python3 scripts/vscode_profile_manager.py restore --variant code --archive /path/to/backup.zip
 ```
 
-List current extensions:
+After reviewing the targets and closing VS Code:
 
 ```bash
-code --list-extensions --show-versions --profile "Python"
+python3 scripts/vscode_profile_manager.py restore --variant code --archive /path/to/backup.zip --confirm
 ```
 
-For bulk operations, use the helper:
+Restore creates a pre-restore recovery archive, rejects traversal/symlink/oversized members, writes files atomically, and rolls back file writes on failure. It does not reconcile installed extensions automatically; use the archived extension snapshot as recovery evidence and manage extensions through the CLI or UI.
+
+For portable sharing or full profile migration, prefer the Profiles editor's local `.code-profile` export/import. Use a GitHub gist only when the user intentionally wants an unlisted share link. Machine-scoped settings are not exported.
+
+## Manage extensions
+
+Read-only listing:
 
 ```bash
-python scripts/vscode_profile_manager.py install-extensions --profile "Python" --extensions ms-python.python charliermarsh.ruff
+python3 scripts/vscode_profile_manager.py list-extensions --profile "Python" --show-versions
 ```
 
-### 6. Edit settings safely
-
-If the profile settings path is known:
+Install an explicit set:
 
 ```bash
-python scripts/vscode_profile_manager.py merge-settings --file "/path/to/settings.json" --set-json '{"editor.formatOnSave":true,"editor.defaultFormatter":"charliermarsh.ruff"}'
+python3 scripts/vscode_profile_manager.py install-extensions --profile "Python" --extensions ms-python.python charliermarsh.ruff
 ```
 
-For JSON arrays like `keybindings.json`, edit manually or with a small script that preserves valid JSONC. Do not use a top-level object merge command on array files.
+The direct install command can also pass an explicitly reviewed `.vsix` path to VS Code. Manifests accept Marketplace IDs only (optionally `publisher.extension@version`) because a VSIX path cannot be identified reliably enough for transactional rollback.
 
-### 7. Maintain profile manifests
-
-For repeatable profile setup, keep a manifest in version control or in a personal dotfiles folder. Use this structure for command generation and audit:
-
-```json
-{
-  "profile": "Python",
-  "variant": "code",
-  "extensions": [
-    "ms-python.python",
-    "charliermarsh.ruff"
-  ],
-  "settings": {
-    "editor.formatOnSave": true,
-    "[python]": {
-      "editor.defaultFormatter": "charliermarsh.ruff"
-    }
-  },
-  "notes": "Purpose, assumptions, machine-specific exclusions."
-}
-```
-
-Use manifests to reconstruct or audit profiles rather than relying on undocumented VS Code state.
-
-To apply profile file changes from a manifest, include either:
-
-- `profileId`: internal folder name from `list-profiles`
-- `settingsFile`: exact path opened from VS Code's profile Settings JSON command
-
-Without one of those targets, `apply-spec` must stop before creating/opening VS Code or installing extensions. Manifest fields for `settings`, `removeSettings`, `keybindings`, `tasks`, and `snippets` are profile-file changes and require a target.
-
-### 8. Audit and repair
-
-When debugging profile issues:
-
-1. Check the active profile in the VS Code title bar / Manage gear / Profiles editor.
-2. Use `@modified` in Settings UI to see changed settings.
-3. Validate JSON/JSONC files for syntax errors.
-4. List profile-specific extensions.
-5. Temporarily open an Empty Profile to determine whether the issue is caused by an extension or setting.
-6. If settings will not save, inspect `settings.json` for syntax errors.
-
-## Common tasks
-
-### Create a clean Python profile
+Uninstall only after explicit user authorization:
 
 ```bash
-mkdir -p ~/tmp/vscode-profile-bootstrap && code ~/tmp/vscode-profile-bootstrap --profile "Python"
-code --install-extension ms-python.python --profile "Python"
-code --install-extension ms-python.vscode-python-envs --profile "Python"
-code --install-extension charliermarsh.ruff --profile "Python"
-code --install-extension tamasfe.even-better-toml --profile "Python"
+python3 scripts/vscode_profile_manager.py uninstall-extensions --profile "Python" --extensions publisher.extension
 ```
 
-Then open the profile settings JSON from VS Code and apply:
+Remote windows such as SSH, Dev Containers, and WSL do not sync extensions to or from the local window. Prefer `.vscode/extensions.json` recommendations or `devcontainer.json` customizations for repository-controlled remote tooling.
 
-```json
-{
-  "editor.formatOnSave": true,
-  "python.analysis.autoImportCompletions": true,
-  "[python]": {
-    "editor.defaultFormatter": "charliermarsh.ruff"
-  }
-}
-```
+## Edit one settings file
 
-### Create a clean AI-agent coding profile
+Preview a top-level replacement merge:
 
 ```bash
-mkdir -p ~/tmp/vscode-profile-bootstrap && code ~/tmp/vscode-profile-bootstrap --profile "AI Agent Coding"
-code --install-extension github.copilot --profile "AI Agent Coding"
-code --install-extension github.copilot-chat --profile "AI Agent Coding"
-code --install-extension ms-vscode-remote.remote-containers --profile "AI Agent Coding"
-code --install-extension ms-vscode-remote.remote-ssh --profile "AI Agent Coding"
+python3 scripts/vscode_profile_manager.py merge-settings --file "/path/to/settings.json" --set-json '{"editor.formatOnSave":true}' --dry-run
 ```
 
-Then add only agent/tooling-specific settings that should not bleed into the default profile.
+Then apply it:
 
-### Export/share a profile
+```bash
+python3 scripts/vscode_profile_manager.py merge-settings --file "/path/to/settings.json" --set-json '{"editor.formatOnSave":true}'
+```
 
-Use VS Code Profiles editor → overflow menu on the profile → Export. Export either as a local `.code-profile` file or a GitHub gist. Prefer local `.code-profile` for personal backups; prefer a gist only when the user intentionally wants a share link.
+Object-valued settings are replaced by default, matching top-level setting semantics. Use `--strategy deep` only when retaining unspecified nested members is intentional. Every write is atomic and makes an adjacent timestamped `.bak` copy when the file already exists.
 
-### Import a profile
+## Use repeatable manifests
 
-Use Profiles editor → New Profile dropdown → Import Profile. Import from a local `.code-profile` file or a gist URL, review the selected profile contents, then create/import.
+Start from `assets/example-profile-spec.json` or scaffold a spec; scaffolding copies the JSON Schema beside the output file:
 
-## Helper scripts
+```bash
+python3 scripts/vscode_profile_manager.py scaffold-spec --profile "Python" --out ~/profiles/python.json
+```
 
-This skill includes:
+Profile-file fields require `profileId` from `list-profiles` or an exact profile `settingsFile`. Supported fields include Marketplace extension IDs/removals, settings and merge strategy, keybindings, tasks, snippets, and MCP server additions/removals.
 
-- `scripts/vscode_profile_manager.py`: safe helper for path/profile discovery, backups, JSONC validation, settings/profile-file writes, extension listing/installation/uninstallation, manifest dry-runs, and profile snapshots.
-- `assets/example-profile-spec.json`: example manifest for repeatable profile setup.
-- `assets/profile-spec.schema.json`: schema for profile manifests.
-- `references/vscode-profiles-research.md`: grounded notes on VS Code profile behaviour and source links.
+Validate and preview:
 
-## Response style when using this skill
+```bash
+python3 scripts/vscode_profile_manager.py validate-spec --spec ~/profiles/python.json
+python3 scripts/vscode_profile_manager.py apply-spec --spec ~/profiles/python.json --dry-run
+```
 
-- Give the user one command at a time when they are actively troubleshooting.
-- Be explicit about whether a command edits VS Code state or only reads it.
-- Show exactly which file will be changed before changing it.
-- Summarise completed changes by profile name, changed files, installed/uninstalled extensions, and backup location.
+Apply non-destructive changes:
+
+```bash
+python3 scripts/vscode_profile_manager.py apply-spec --spec ~/profiles/python.json
+```
+
+After explicit approval for removal fields:
+
+```bash
+python3 scripts/vscode_profile_manager.py apply-spec --spec ~/profiles/python.json --confirm-destructive
+```
+
+`apply-spec` validates the complete manifest before mutation, verifies profile identity, creates a recovery archive, writes files atomically, applies extension changes fail-fast, and attempts file and touched-extension rollback if any step fails.
+
+MCP manifest changes merge only the named entries under `mcp.json`'s `servers` object. They never start a server or modify its separately stored enabled/trust state. After applying, review the server in the MCP configuration editor and let the user decide whether to trust or start it.
+
+## Diagnose profile problems
+
+1. Confirm the current profile in the title bar, Manage button, or Profiles editor.
+2. Use `@modified` in Settings to inspect overrides.
+3. Run `validate` on relevant JSON/JSONC files.
+4. Run `snapshot` for settings, tasks, keybindings, snippets, and extension versions. Include MCP content only with explicit `--include-mcp` because it may be sensitive.
+5. Open an Empty or Temporary Profile to distinguish core behavior from extensions/settings.
+6. Use Settings Sync's **Show Synced Data** and local backup views for sync recovery.
+
+Read `references/vscode-profiles-research.md` when current behavior, inheritance, MCP trust, Settings Sync, export, remote windows, or competing declarative tools affect the task.
+
+## Reporting
+
+State whether each command was read-only or mutating. Before mutation, show the resolved profile name, ID, files, extension actions, and backup destination. After completion, report changed files, installed/uninstalled extensions, recovery archive, validation results, and any rollback warnings.
