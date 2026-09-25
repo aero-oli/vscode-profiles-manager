@@ -17,7 +17,6 @@ import difflib
 import json
 import os
 import platform
-import re
 import shutil
 import stat
 import subprocess
@@ -353,19 +352,6 @@ def remove_keys(data: dict[str, Any], keys: Iterable[str]) -> None:
         data.pop(key, None)
 
 
-def run_cmd(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
-    eprint("+", " ".join(shlex_quote(x) for x in cmd))
-    return subprocess.run(
-        cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check
-    )
-
-
-def shlex_quote(value: str) -> str:
-    if re.fullmatch(r"[A-Za-z0-9_./:=@+~,-]+", value):
-        return value
-    return "'" + value.replace("'", "'\\''") + "'"
-
-
 def build_paths(args: argparse.Namespace) -> dict[str, str | bool]:
     user_dir = user_dir_from_args(args)
     profiles_dir = user_dir / "profiles"
@@ -466,12 +452,105 @@ def command_list_profiles(args: argparse.Namespace) -> None:
     )
 
 
-def command_profile_setting_path(args: argparse.Namespace) -> None:
+def default_profile_info(user_dir: Path) -> dict[str, Any]:
+    return {
+        "id": None,
+        "name": "Default",
+        "source": "default",
+        "profileDir": str(user_dir),
+        "profileDirExists": user_dir.exists(),
+        "settingsFile": str(user_dir / "settings.json"),
+        "keybindingsFile": str(user_dir / "keybindings.json"),
+        "tasksFile": str(user_dir / "tasks.json"),
+        "mcpFile": str(user_dir / "mcp.json"),
+        "snippetsDir": str(user_dir / "snippets"),
+        "hasSettings": (user_dir / "settings.json").exists(),
+        "hasKeybindings": (user_dir / "keybindings.json").exists(),
+        "hasTasks": (user_dir / "tasks.json").exists(),
+        "hasMcp": (user_dir / "mcp.json").exists(),
+        "hasSnippets": (user_dir / "snippets").exists(),
+    }
+
+
+def resolve_profile_reference(
+    user_dir: Path, reference: str
+) -> tuple[dict[str, Any], str]:
+    """Resolve a profile display name first, with an exact ID as fallback."""
+    if not reference.strip():
+        raise VscodeProfileError("Profile name must not be empty")
+    if reference.casefold() == "default":
+        return default_profile_info(user_dir), "default"
+
+    profiles = discover_profiles(user_dir)
+    exact_names = [item for item in profiles if item.get("name") == reference]
+    if len(exact_names) == 1:
+        return exact_names[0], "name"
+    if len(exact_names) > 1:
+        raise VscodeProfileError(f"Profile name is ambiguous: {reference!r}")
+
+    folded_names = [
+        item
+        for item in profiles
+        if isinstance(item.get("name"), str)
+        and item["name"].casefold() == reference.casefold()
+    ]
+    if len(folded_names) == 1:
+        return folded_names[0], "name-case-insensitive"
+    if len(folded_names) > 1:
+        raise VscodeProfileError(f"Profile name is ambiguous: {reference!r}")
+
+    id_matches = [item for item in profiles if item["id"] == reference]
+    if len(id_matches) == 1:
+        return id_matches[0], "id"
+
+    known = [item["name"] or item["id"] for item in profiles]
+    suffix = f" Known profiles: {', '.join(known)}" if known else ""
+    raise VscodeProfileError(f"Profile not found: {reference!r}.{suffix}")
+
+
+def require_profile_dir(profile: dict[str, Any]) -> Path:
+    profile_dir = Path(profile["profileDir"]).resolve()
+    if not profile.get("profileDirExists"):
+        raise VscodeProfileError(
+            f"Profile files do not exist locally for {profile.get('name') or profile.get('id')!r}"
+        )
+    return profile_dir
+
+
+def command_show_profile(args: argparse.Namespace) -> None:
     user_dir = user_dir_from_args(args)
-    if not args.profile_id:
-        raise VscodeProfileError("--profile-id is required")
-    profile_id = validate_profile_id(args.profile_id)
-    print(user_dir / "profiles" / profile_id / "settings.json")
+    profile, matched_by = resolve_profile_reference(user_dir, args.profile)
+    profile_name = profile.get("name")
+    context_issue = cli_context_issue(args)
+    if matched_by == "id" and not profile_name:
+        extension_context: dict[str, Any] = {
+            "profile": None,
+            "extensions": [],
+            "error": "Extensions cannot be targeted safely because this internal ID has no verified display name.",
+        }
+    elif context_issue:
+        extension_context = {
+            "profile": profile_name,
+            "extensions": [],
+            "error": context_issue,
+        }
+    else:
+        extension_context = extension_snapshot_for_profile(
+            code_bin_for_variant(args.variant, args.code_bin),
+            None if matched_by == "default" else profile_name,
+            code_context_args(args),
+        )
+    print(
+        json.dumps(
+            {
+                "userDir": str(user_dir),
+                "matchedBy": matched_by,
+                "profile": profile,
+                "extensionContext": extension_context,
+            },
+            indent=2,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -522,15 +601,24 @@ def collect_profile_backup_items(user_dir: Path, profile_id: str) -> list[Backup
     return items
 
 
-def collect_backup_items(user_dir: Path, profile_id: str | None) -> list[BackupItem]:
-    if profile_id:
-        return collect_profile_backup_items(user_dir, profile_id)
+def collect_default_backup_items(user_dir: Path) -> list[BackupItem]:
     items = [
         BackupItem(user_dir / filename, filename)
         for filename in SAFE_DEFAULT_FILES
         if (user_dir / filename).is_file() and not (user_dir / filename).is_symlink()
     ]
     items.extend(collect_snippet_items(user_dir / "snippets", "snippets"))
+    return items
+
+
+def collect_backup_items(
+    user_dir: Path, profile_id: str | None, default_only: bool = False
+) -> list[BackupItem]:
+    if profile_id:
+        return collect_profile_backup_items(user_dir, profile_id)
+    items = collect_default_backup_items(user_dir)
+    if default_only:
+        return items
     profiles_dir = user_dir / "profiles"
     if profiles_dir.exists():
         for profile_dir in sorted(profiles_dir.iterdir()):
@@ -577,6 +665,7 @@ def collect_extension_snapshots(
     user_dir: Path,
     profile_id: str | None,
     profile_name: str | None,
+    default_only: bool = False,
 ) -> list[dict[str, Any]]:
     if getattr(args, "skip_extensions", False):
         return []
@@ -592,6 +681,8 @@ def collect_extension_snapshots(
         ]
     code_bin = code_bin_for_variant(args.variant, getattr(args, "code_bin", None))
     context = code_context_args(args)
+    if default_only:
+        return [extension_snapshot_for_profile(code_bin, None, context)]
     if profile_id:
         name = profile_name
         if not name:
@@ -621,28 +712,37 @@ def create_backup_archive(
     out_dir: Path,
     profile_id: str | None = None,
     profile_name: str | None = None,
+    default_only: bool = False,
     reason: str = "manual",
 ) -> tuple[Path, dict[str, Any]]:
+    if profile_id and default_only:
+        raise VscodeProfileError(
+            "A backup cannot target a named and Default Profile together"
+        )
     if profile_id:
         profile_id = validate_profile_id(profile_id)
-    items = collect_backup_items(user_dir, profile_id)
+    items = collect_backup_items(user_dir, profile_id, default_only=default_only)
     extension_snapshots = collect_extension_snapshots(
-        args, user_dir, profile_id, profile_name
+        args, user_dir, profile_id, profile_name, default_only=default_only
     )
     if not items and not extension_snapshots:
         raise VscodeProfileError(f"Nothing found to back up under {user_dir}")
     out_dir.mkdir(parents=True, exist_ok=True)
-    label = (
-        f"{args.variant}-profile-{profile_id}"
-        if profile_id
-        else f"{args.variant}-user-config"
-    )
+    if profile_id:
+        label = f"{args.variant}-profile-{profile_id}"
+        scope = "profile"
+    elif default_only:
+        label = f"{args.variant}-default-profile"
+        scope = "default-profile"
+    else:
+        label = f"{args.variant}-user-config"
+        scope = "user-config"
     zip_path = out_dir / f"{label}-{now_stamp()}.zip"
     manifest = {
         "formatVersion": 1,
         "createdAt": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "variant": args.variant,
-        "scope": "profile" if profile_id else "user-config",
+        "scope": scope,
         "profileId": profile_id,
         "profile": profile_name,
         "reason": reason,
@@ -686,33 +786,35 @@ def create_backup_archive(
 
 def command_backup(args: argparse.Namespace) -> None:
     user_dir = user_dir_from_args(args)
-    profile_id = validate_profile_id(args.profile_id) if args.profile_id else None
-    if profile_id and not (user_dir / "profiles" / profile_id).is_dir():
-        raise VscodeProfileError(
-            f"Profile folder does not exist: {user_dir / 'profiles' / profile_id}"
-        )
-    if profile_id and args.profile:
-        current_name = next(
-            (
-                item.get("name")
-                for item in discover_profiles(user_dir)
-                if item["id"] == profile_id
-            ),
-            None,
-        )
-        if current_name and current_name != args.profile:
-            raise VscodeProfileError(
-                f"Profile identity mismatch: ID {profile_id!r} is {current_name!r}, not {args.profile!r}"
-            )
+    profile_id: str | None = None
+    profile_name: str | None = None
+    matched_by: str | None = None
+    default_only = False
+    if args.profile:
+        profile, matched_by = resolve_profile_reference(user_dir, args.profile)
+        if matched_by == "default":
+            require_profile_dir(profile)
+            default_only = True
+            profile_name = "Default"
+        else:
+            require_profile_dir(profile)
+            profile_id = validate_profile_id(profile["id"])
+            profile_name = profile.get("name")
     out_dir = expand_path(args.out or (Path.home() / "Desktop" / BACKUP_DIR_NAME))
     zip_path, manifest = create_backup_archive(
         args,
         user_dir,
         out_dir,
         profile_id=profile_id,
-        profile_name=args.profile,
+        profile_name=profile_name,
+        default_only=default_only,
     )
-    print(json.dumps({"backup": str(zip_path), "manifest": manifest}, indent=2))
+    print(
+        json.dumps(
+            {"backup": str(zip_path), "matchedBy": matched_by, "manifest": manifest},
+            indent=2,
+        )
+    )
 
 
 def command_validate(args: argparse.Namespace) -> None:
@@ -725,38 +827,15 @@ def command_validate(args: argparse.Namespace) -> None:
     )
 
 
-def command_validate_spec(args: argparse.Namespace) -> None:
-    path = expand_path(args.spec)
-    spec = load_jsonc(path)
-    warnings = validate_manifest(spec)
-    variant = spec.get("variant", args.variant)
-    user_dir = user_dir_from_args(args, variant)
-    profile_dir = resolve_profile_target(
-        spec,
-        user_dir,
-        allow_unverified=args.allow_unverified_profile,
-        require_target=False,
-    )
-    if profile_dir is None and spec_has_profile_file_changes(spec):
-        warnings.append(
-            "Profile file changes need profileId or settingsFile before they can be planned"
-        )
-    print(
-        json.dumps(
-            {
-                "file": str(path),
-                "valid": True,
-                "profile": spec["profile"],
-                "profileDir": str(profile_dir) if profile_dir else None,
-                "warnings": warnings,
-            },
-            indent=2,
-        )
-    )
-
-
 def command_merge_settings(args: argparse.Namespace) -> None:
-    path = expand_path(args.file)
+    if args.profile:
+        user_dir = user_dir_from_args(args)
+        profile, matched_by = resolve_profile_reference(user_dir, args.profile)
+        profile_dir = require_profile_dir(profile)
+        path = profile_dir / "settings.json"
+    else:
+        matched_by = "file"
+        path = expand_path(args.file)
     updates: dict[str, Any] = {}
     if args.set_json:
         loaded = json.loads(args.set_json)
@@ -794,6 +873,8 @@ def command_merge_settings(args: argparse.Namespace) -> None:
         json.dumps(
             {
                 "file": str(path),
+                "profile": args.profile,
+                "matchedBy": matched_by,
                 "backup": str(backup) if backup else None,
                 "set": list(updates),
                 "removed": removals,
@@ -876,370 +957,6 @@ def command_uninstall_extensions(args: argparse.Namespace) -> None:
     print(json.dumps({"profile": args.profile, "results": results}, indent=2))
 
 
-def command_scaffold_spec(args: argparse.Namespace) -> None:
-    spec = {
-        "$schema": "./profile-spec.schema.json",
-        "profile": args.profile,
-        "variant": args.variant,
-        "workspace": args.workspace or "~/tmp/vscode-profile-bootstrap",
-        "extensions": [],
-        "removeExtensions": [],
-        "settings": {},
-        "settingsMerge": "replace",
-        "removeSettings": [],
-        "mcpServers": {},
-        "removeMcpServers": [],
-        "notes": "Fill in the intended purpose, assumptions, and machine-specific exclusions. Add profileId or settingsFile before applying profile-file changes.",
-    }
-    if args.out:
-        out = expand_path(args.out)
-        schema_source = (
-            Path(__file__).resolve().parents[1] / "assets" / "profile-spec.schema.json"
-        )
-        schema_target = out.parent / "profile-spec.schema.json"
-        if not schema_target.exists():
-            schema_target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(schema_source, schema_target)
-        write_json(out, spec)
-        print(json.dumps({"spec": str(out), "schema": str(schema_target)}, indent=2))
-    else:
-        print(json.dumps(spec, indent=2))
-
-
-def command_generate_commands(args: argparse.Namespace) -> None:
-    spec_path = expand_path(args.spec)
-    spec = load_jsonc(spec_path)
-    validate_manifest(spec)
-    profile = spec["profile"]
-    variant = spec.get("variant", args.variant)
-    require_cli_context(args, variant)
-    code_bin = spec.get("codeBin") or code_bin_for_variant(variant, args.code_bin)
-    workspace = expand_path(spec.get("workspace") or "~/tmp/vscode-profile-bootstrap")
-    extensions = spec.get("extensions", [])
-    remove_extensions = spec.get("removeExtensions", [])
-    context = code_context_args(args)
-
-    lines = [f"mkdir -p {shlex_quote(str(workspace))}"]
-    open_cmd = [code_bin, str(workspace), *context, "--profile", profile]
-    lines.append(" ".join(shlex_quote(part) for part in open_cmd))
-    for ext in extensions:
-        cmd = [code_bin, "--install-extension", ext, *context, "--profile", profile]
-        lines.append(" ".join(shlex_quote(part) for part in cmd))
-    for ext in remove_extensions:
-        cmd = [code_bin, "--uninstall-extension", ext, *context, "--profile", profile]
-        lines.append(" ".join(shlex_quote(part) for part in cmd))
-    if spec_has_profile_file_changes(spec):
-        user_dir = user_dir_from_args(args, variant)
-        target = profile_dir_for_spec(spec, user_dir)
-        if target:
-            lines.append(
-                f"# Use apply-spec to back up and atomically write files under {shlex_quote(str(target))}."
-            )
-        else:
-            lines.append(
-                "# Profile file changes require profileId or settingsFile before apply-spec can write them."
-            )
-    print("\n".join(lines))
-
-
-def command_snapshot(args: argparse.Namespace) -> None:
-    user_dir = user_dir_from_args(args)
-    snapshot: dict[str, Any] = {
-        "createdAt": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
-        "variant": args.variant,
-        "profile": args.profile,
-        "userDir": str(user_dir),
-    }
-    code_bin = code_bin_for_variant(args.variant, args.code_bin)
-    if args.profile:
-        context_issue = cli_context_issue(args)
-        extension_snapshot = (
-            {
-                "profile": args.profile,
-                "returncode": None,
-                "extensions": [],
-                "error": f"Extension snapshot skipped: {context_issue}",
-            }
-            if context_issue
-            else extension_snapshot_for_profile(
-                code_bin, args.profile, code_context_args(args)
-            )
-        )
-        snapshot["extensionSnapshot"] = extension_snapshot
-    if args.profile_id:
-        profile_id = validate_profile_id(args.profile_id)
-        profile_dir = ensure_within(
-            user_dir / "profiles" / profile_id, user_dir / "profiles", "profileId"
-        )
-        snapshot["profileId"] = profile_id
-        snapshot["profileFiles"] = snapshot_profile_files(
-            profile_dir, include_mcp=args.include_mcp
-        )
-    default_settings = user_dir / "settings.json"
-    if default_settings.exists() and args.include_default_settings:
-        snapshot["defaultSettings"] = load_jsonc(default_settings, default={})
-    if args.out:
-        out = expand_path(args.out)
-        write_json(out, snapshot)
-        print(out)
-    else:
-        print(json.dumps(snapshot, indent=2))
-
-
-def spec_has_profile_file_changes(spec: dict[str, Any]) -> bool:
-    return bool(
-        spec.get("settings")
-        or spec.get("removeSettings")
-        or spec.get("keybindings") is not None
-        or spec.get("tasks") is not None
-        or spec.get("snippets")
-        or spec.get("mcpServers")
-        or spec.get("removeMcpServers")
-    )
-
-
-def profile_dir_for_spec(spec: dict[str, Any], user_dir: Path) -> Path | None:
-    settings_file = spec.get("settingsFile")
-    if settings_file:
-        return expand_path(settings_file).parent
-    profile_id = spec.get("profileId")
-    if profile_id:
-        return user_dir / "profiles" / validate_profile_id(str(profile_id))
-    return None
-
-
-MANIFEST_FIELDS = {
-    "$schema",
-    "profile",
-    "variant",
-    "codeBin",
-    "workspace",
-    "profileId",
-    "settingsFile",
-    "settings",
-    "settingsMerge",
-    "removeSettings",
-    "extensions",
-    "removeExtensions",
-    "keybindings",
-    "snippets",
-    "tasks",
-    "mcpServers",
-    "removeMcpServers",
-    "notes",
-}
-
-
-def validate_string_list(value: Any, field: str) -> list[str]:
-    if value is None:
-        return []
-    if not isinstance(value, list) or not all(
-        isinstance(item, str) and item.strip() for item in value
-    ):
-        raise VscodeProfileError(f"{field} must be an array of non-empty strings")
-    if len(set(value)) != len(value):
-        raise VscodeProfileError(f"{field} must not contain duplicates")
-    return value
-
-
-MANIFEST_EXTENSION_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9_-]*\.[A-Za-z0-9][A-Za-z0-9_.-]*(?:@[A-Za-z0-9][A-Za-z0-9.+_-]*)?$"
-)
-
-
-def validate_manifest_extensions(
-    value: Any, field: str, allow_version: bool
-) -> list[str]:
-    extensions = validate_string_list(value, field)
-    normalized_ids: list[str] = []
-    for extension in extensions:
-        if not MANIFEST_EXTENSION_RE.fullmatch(extension) or (
-            not allow_version and "@" in extension
-        ):
-            qualifier = (
-                " with an optional @version" if allow_version else " without @version"
-            )
-            raise VscodeProfileError(
-                f"{field} entries must be Marketplace extension IDs{qualifier}; use the direct extension commands for VSIX files"
-            )
-        normalized_ids.append(extension.split("@", 1)[0].lower())
-    if len(set(normalized_ids)) != len(normalized_ids):
-        raise VscodeProfileError(
-            f"{field} must not contain the same extension ID more than once"
-        )
-    return normalized_ids
-
-
-def validate_manifest(spec: Any) -> list[str]:
-    if not isinstance(spec, dict):
-        raise VscodeProfileError("Spec must be a JSON object")
-    unknown = sorted(set(spec) - MANIFEST_FIELDS)
-    if unknown:
-        raise VscodeProfileError(f"Unknown manifest fields: {', '.join(unknown)}")
-    profile = spec.get("profile")
-    if not isinstance(profile, str) or not profile.strip():
-        raise VscodeProfileError("Spec must contain a non-empty profile string")
-    variant = spec.get("variant", DEFAULT_VARIANT)
-    if variant not in {"code", "insiders", "codium", "custom"}:
-        raise VscodeProfileError("variant must be code, insiders, codium, or custom")
-    for field in ("codeBin", "workspace", "settingsFile", "notes"):
-        if (
-            field in spec
-            and spec[field] is not None
-            and not isinstance(spec[field], str)
-        ):
-            raise VscodeProfileError(f"{field} must be a string")
-    if spec.get("profileId") is not None:
-        if not isinstance(spec["profileId"], str):
-            raise VscodeProfileError("profileId must be a string")
-        validate_profile_id(spec["profileId"])
-    if (
-        "settings" in spec
-        and spec.get("settings") is not None
-        and not isinstance(spec["settings"], dict)
-    ):
-        raise VscodeProfileError("settings must be a JSON object")
-    if spec.get("settingsMerge", "replace") not in {"replace", "deep"}:
-        raise VscodeProfileError("settingsMerge must be 'replace' or 'deep'")
-    validate_string_list(spec.get("removeSettings"), "removeSettings")
-    install_ids = validate_manifest_extensions(
-        spec.get("extensions"), "extensions", allow_version=True
-    )
-    remove_extension_ids = validate_manifest_extensions(
-        spec.get("removeExtensions"), "removeExtensions", allow_version=False
-    )
-    validate_string_list(spec.get("removeMcpServers"), "removeMcpServers")
-    if "keybindings" in spec and spec.get("keybindings") is not None:
-        if not isinstance(spec["keybindings"], list) or not all(
-            isinstance(item, dict) for item in spec["keybindings"]
-        ):
-            raise VscodeProfileError("keybindings must be an array of JSON objects")
-    if (
-        "tasks" in spec
-        and spec.get("tasks") is not None
-        and not isinstance(spec["tasks"], dict)
-    ):
-        raise VscodeProfileError("tasks must be a JSON object")
-    snippets = spec.get("snippets") or {}
-    if not isinstance(snippets, dict):
-        raise VscodeProfileError("snippets must be an object keyed by snippet filename")
-    for filename, value in snippets.items():
-        path = Path(str(filename))
-        if (
-            not isinstance(filename, str)
-            or path.is_absolute()
-            or ".." in path.parts
-            or len(path.parts) != 1
-            or "/" in filename
-            or "\\" in filename
-        ):
-            raise VscodeProfileError(f"Invalid snippet filename: {filename}")
-        if not isinstance(value, dict):
-            raise VscodeProfileError(
-                f"Snippet file {filename} must contain a JSON object"
-            )
-    mcp_servers = spec.get("mcpServers") or {}
-    if not isinstance(mcp_servers, dict) or not all(
-        isinstance(name, str) and name.strip() and isinstance(config, dict)
-        for name, config in mcp_servers.items()
-    ):
-        raise VscodeProfileError(
-            "mcpServers must be an object of named server configuration objects"
-        )
-    overlap = set(install_ids) & set(remove_extension_ids)
-    if overlap:
-        raise VscodeProfileError(
-            f"Extensions cannot be installed and removed together: {', '.join(sorted(overlap))}"
-        )
-    return potential_secret_warnings(mcp_servers)
-
-
-def potential_secret_warnings(value: Any, path: str = "mcpServers") -> list[str]:
-    warnings: list[str] = []
-    if isinstance(value, dict):
-        for key, child in value.items():
-            child_path = f"{path}.{key}"
-            if re.search(
-                r"(token|secret|password|api.?key)", str(key), re.IGNORECASE
-            ) and isinstance(child, str):
-                if not re.search(r"\$\{(?:env|input):", child):
-                    warnings.append(
-                        f"Possible literal secret at {child_path}; prefer an env or input variable"
-                    )
-            warnings.extend(potential_secret_warnings(child, child_path))
-    elif isinstance(value, list):
-        for index, child in enumerate(value):
-            warnings.extend(potential_secret_warnings(child, f"{path}[{index}]"))
-    return warnings
-
-
-def resolve_profile_target(
-    spec: dict[str, Any],
-    user_dir: Path,
-    allow_unverified: bool = False,
-    require_target: bool = True,
-) -> Path | None:
-    if not spec_has_profile_file_changes(spec):
-        return None
-    profiles_root = (user_dir / "profiles").resolve()
-    profile_id = spec.get("profileId")
-    settings_file_value = spec.get("settingsFile")
-    profile_dir: Path | None = None
-    if profile_id:
-        profile_id = validate_profile_id(profile_id)
-        profile_dir = ensure_within(
-            profiles_root / profile_id, profiles_root, "profileId"
-        )
-    if settings_file_value:
-        settings_file = expand_path(settings_file_value)
-        if settings_file.name != "settings.json":
-            raise VscodeProfileError(
-                "settingsFile must point to a file named settings.json"
-            )
-        settings_profile_dir = ensure_within(
-            settings_file.parent, profiles_root, "settingsFile"
-        )
-        if settings_profile_dir.parent != profiles_root:
-            raise VscodeProfileError(
-                "settingsFile must be directly inside one named profile folder"
-            )
-        validate_profile_id(settings_profile_dir.name)
-        if profile_dir and settings_profile_dir != profile_dir:
-            raise VscodeProfileError(
-                "profileId and settingsFile resolve to different profile folders"
-            )
-        profile_dir = settings_profile_dir
-        profile_id = settings_profile_dir.name
-    if profile_dir is None:
-        if require_target:
-            raise VscodeProfileError(
-                "Profile file changes require settingsFile or profileId before any state is changed"
-            )
-        return None
-    if not profile_dir.is_dir():
-        raise VscodeProfileError(
-            f"Profile folder does not exist: {profile_dir}. Create it with VS Code, then run list-profiles."
-        )
-    discovered = next(
-        (item for item in discover_profiles(user_dir) if item["id"] == profile_id), None
-    )
-    discovered_name = discovered.get("name") if discovered else None
-    if discovered_name and discovered_name != spec["profile"]:
-        raise VscodeProfileError(
-            f"Profile identity mismatch: ID {profile_id!r} is {discovered_name!r}, not {spec['profile']!r}"
-        )
-    if (
-        profile_id
-        and not discovered_name
-        and not settings_file_value
-        and not allow_unverified
-    ):
-        raise VscodeProfileError(
-            "Could not verify profileId against a display name. Use settingsFile opened by VS Code or --allow-unverified-profile."
-        )
-    return profile_dir
-
-
 def snapshot_profile_files(
     profile_dir: Path, include_mcp: bool = False
 ) -> dict[str, Any]:
@@ -1265,103 +982,12 @@ def snapshot_profile_files(
     return result
 
 
-def ensure_rewrite_allowed(path: Path, allow_comment_loss: bool) -> None:
-    if (
-        path.exists()
-        and has_jsonc_comments(path.read_text(encoding="utf-8"))
-        and not allow_comment_loss
-    ):
-        raise VscodeProfileError(
-            f"{path} contains comments. Use a targeted editor or rerun with --allow-comment-loss after reviewing the dry run."
-        )
-
-
-@dataclass
-class PlannedFile:
-    path: Path
-    kind: str
-    before: Any
-    after: Any
-    existed: bool
-
-
 @dataclass
 class FileState:
     path: Path
     existed: bool
     content: bytes | None
     mode: int | None
-
-
-def plan_profile_files(
-    spec: dict[str, Any], profile_dir: Path, allow_comment_loss: bool
-) -> list[PlannedFile]:
-    planned: list[PlannedFile] = []
-    settings = spec.get("settings") or {}
-    remove_settings = spec.get("removeSettings") or []
-    if settings or remove_settings:
-        path = (
-            expand_path(spec["settingsFile"])
-            if spec.get("settingsFile")
-            else profile_dir / "settings.json"
-        )
-        before = load_jsonc(path, default={})
-        if not isinstance(before, dict):
-            raise VscodeProfileError(f"Expected top-level object in {path}")
-        ensure_rewrite_allowed(path, allow_comment_loss)
-        after = merge_settings_data(
-            before, settings, spec.get("settingsMerge", "replace")
-        )
-        remove_keys(after, remove_settings)
-        planned.append(PlannedFile(path, "settings", before, after, path.exists()))
-    for field, filename in (
-        ("keybindings", "keybindings.json"),
-        ("tasks", "tasks.json"),
-    ):
-        if field in spec and spec[field] is not None:
-            path = profile_dir / filename
-            ensure_rewrite_allowed(path, allow_comment_loss)
-            before = load_jsonc(path, default=[] if field == "keybindings" else {})
-            planned.append(PlannedFile(path, field, before, spec[field], path.exists()))
-    for filename, value in (spec.get("snippets") or {}).items():
-        path = ensure_within(
-            profile_dir / "snippets" / filename,
-            profile_dir / "snippets",
-            "snippet filename",
-        )
-        ensure_rewrite_allowed(path, allow_comment_loss)
-        before = load_jsonc(path, default={})
-        planned.append(PlannedFile(path, "snippet", before, value, path.exists()))
-    mcp_updates = spec.get("mcpServers") or {}
-    mcp_removals = spec.get("removeMcpServers") or []
-    if mcp_updates or mcp_removals:
-        path = profile_dir / "mcp.json"
-        ensure_rewrite_allowed(path, allow_comment_loss)
-        before = load_jsonc(path, default={})
-        if not isinstance(before, dict):
-            raise VscodeProfileError(f"Expected top-level object in {path}")
-        after = dict(before)
-        servers = after.get("servers", {})
-        if not isinstance(servers, dict):
-            raise VscodeProfileError(f"Expected servers object in {path}")
-        servers = dict(servers)
-        servers.update(mcp_updates)
-        remove_keys(servers, mcp_removals)
-        after["servers"] = servers
-        planned.append(PlannedFile(path, "mcp", before, after, path.exists()))
-    return planned
-
-
-def capture_file_states(planned: list[PlannedFile]) -> list[FileState]:
-    return [
-        FileState(
-            item.path,
-            item.path.exists(),
-            item.path.read_bytes() if item.path.exists() else None,
-            (item.path.stat().st_mode & 0o777) if item.path.exists() else None,
-        )
-        for item in planned
-    ]
 
 
 def restore_file_states(states: list[FileState]) -> list[str]:
@@ -1377,264 +1003,78 @@ def restore_file_states(states: list[FileState]) -> list[str]:
     return errors
 
 
-def extension_id_and_version(value: str) -> tuple[str, str | None]:
-    if value.lower().endswith(".vsix") or "/" in value or "\\" in value:
-        return value, None
-    if "@" in value:
-        extension_id, version = value.rsplit("@", 1)
-        return extension_id.lower(), version
-    return value.lower(), None
-
-
-def extension_map(lines: Iterable[str]) -> dict[str, str]:
-    result: dict[str, str] = {}
-    for line in lines:
-        extension_id, version = extension_id_and_version(line.strip())
-        result[extension_id] = f"{extension_id}@{version}" if version else extension_id
-    return result
-
-
-def run_extension_change(
-    code_bin: str,
-    profile: str,
-    extension: str,
-    install: bool,
-    context: list[str],
-    force: bool = False,
-) -> dict[str, Any]:
-    flag = "--install-extension" if install else "--uninstall-extension"
-    cmd = [code_bin, flag, extension, *context, "--profile", profile]
-    if install and force:
-        cmd.append("--force")
-    proc = subprocess.run(
-        cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-    result = {
-        "action": "install" if install else "uninstall",
-        "extension": extension,
-        "returncode": proc.returncode,
+def command_snapshot(args: argparse.Namespace) -> None:
+    user_dir = user_dir_from_args(args)
+    snapshot: dict[str, Any] = {
+        "createdAt": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "variant": args.variant,
+        "profile": args.profile,
+        "userDir": str(user_dir),
     }
-    if proc.returncode != 0:
-        raise VscodeProfileError(
-            proc.stderr.strip() or f"Command failed: {' '.join(cmd)}"
-        )
-    return result
-
-
-def rollback_touched_extensions(
-    code_bin: str,
-    profile: str,
-    context: list[str],
-    initial: dict[str, str],
-    touched: set[str],
-) -> list[str]:
-    errors: list[str] = []
-    current_snapshot = extension_snapshot_for_profile(code_bin, profile, context)
-    current = extension_map(current_snapshot.get("extensions", []))
-    for extension_id in sorted(touched):
-        try:
-            if extension_id in initial:
-                if current.get(extension_id) != initial[extension_id]:
-                    run_extension_change(
-                        code_bin,
-                        profile,
-                        initial[extension_id],
-                        True,
-                        context,
-                        force=True,
-                    )
-            elif extension_id in current:
-                run_extension_change(code_bin, profile, extension_id, False, context)
-        except Exception as exc:  # noqa: BLE001 - best-effort rollback reports every failure
-            errors.append(f"{extension_id}: {exc}")
-    return errors
-
-
-def apply_plan_summary(
-    spec: dict[str, Any],
-    profile_dir: Path | None,
-    planned: list[PlannedFile],
-    warnings: list[str],
-) -> dict[str, Any]:
-    return {
-        "profile": spec["profile"],
-        "profileId": profile_dir.name if profile_dir else None,
-        "profileDir": str(profile_dir) if profile_dir else None,
-        "files": [
-            {
-                "path": str(item.path),
-                "kind": item.kind,
-                "operation": "replace" if item.existed else "create",
-                "diff": json_diff(item.path, item.before, item.after),
+    code_bin = code_bin_for_variant(args.variant, args.code_bin)
+    if args.profile:
+        profile, matched_by = resolve_profile_reference(user_dir, args.profile)
+        snapshot["matchedBy"] = matched_by
+        snapshot["resolvedProfile"] = profile
+        profile_name = profile.get("name")
+        context_issue = cli_context_issue(args)
+        if matched_by == "id" and not profile_name:
+            extension_snapshot = {
+                "profile": None,
+                "returncode": None,
+                "extensions": [],
+                "error": "Extension snapshot skipped because the internal ID has no verified display name.",
             }
-            for item in planned
-        ],
-        "installExtensions": spec.get("extensions") or [],
-        "removeExtensions": spec.get("removeExtensions") or [],
-        "warnings": warnings,
-    }
-
-
-def command_apply_spec(args: argparse.Namespace) -> None:
-    spec_path = expand_path(args.spec)
-    spec = load_jsonc(spec_path)
-    warnings = validate_manifest(spec)
-    variant = spec.get("variant", args.variant)
-    user_dir = user_dir_from_args(args, variant)
-    profile_dir = resolve_profile_target(
-        spec,
-        user_dir,
-        allow_unverified=args.allow_unverified_profile,
-        require_target=not args.dry_run,
-    )
-    if profile_dir is None and spec_has_profile_file_changes(spec):
-        warnings.append(
-            "Profile file changes need profileId or settingsFile before they can be planned"
-        )
-    planned = (
-        plan_profile_files(spec, profile_dir, args.allow_comment_loss)
-        if profile_dir
-        else []
-    )
-    destructive = bool(
-        spec.get("removeExtensions")
-        or spec.get("removeSettings")
-        or spec.get("removeMcpServers")
-    )
-    if destructive and not args.confirm_destructive and not args.dry_run:
-        raise VscodeProfileError(
-            "Removal fields require --confirm-destructive after reviewing --dry-run"
-        )
-    summary = apply_plan_summary(spec, profile_dir, planned, warnings)
-    if args.dry_run:
-        print(json.dumps({"dryRun": True, **summary}, indent=2))
-        return
-
-    code_bin = spec.get("codeBin") or code_bin_for_variant(variant, args.code_bin)
-    context = code_context_args(args)
-    has_extension_changes = bool(spec.get("extensions") or spec.get("removeExtensions"))
-    if has_extension_changes:
-        require_cli_context(args, variant)
-    initial_snapshot = (
-        extension_snapshot_for_profile(code_bin, spec["profile"], context)
-        if has_extension_changes
-        else None
-    )
-    if initial_snapshot and initial_snapshot.get("returncode") != 0:
-        raise VscodeProfileError(
-            initial_snapshot.get("stderr")
-            or initial_snapshot.get("error")
-            or "Could not snapshot profile extensions"
-        )
-    initial_extensions = (
-        extension_map(initial_snapshot.get("extensions", []))
-        if initial_snapshot
-        else {}
-    )
-    touched = {
-        extension_id_and_version(value)[0]
-        for value in [
-            *(spec.get("extensions") or []),
-            *(spec.get("removeExtensions") or []),
-        ]
-    }
-    backup_args = argparse.Namespace(**vars(args))
-    backup_args.variant = variant
-    backup_args.code_bin = code_bin
-    backup_args.skip_extensions = False
-    backup_dir = expand_path(
-        args.backup_dir or (Path.home() / "Desktop" / BACKUP_DIR_NAME)
-    )
-    backup_profile_id = (
-        profile_dir.name
-        if profile_dir
-        else next(
-            (
-                item["id"]
-                for item in discover_profiles(user_dir)
-                if item.get("name") == spec["profile"] and item.get("profileDirExists")
-            ),
-            None,
-        )
-    )
-    backup_path, _ = create_backup_archive(
-        backup_args,
-        user_dir,
-        backup_dir,
-        profile_id=backup_profile_id,
-        profile_name=spec["profile"],
-        reason="pre-apply-spec",
-    )
-    states = capture_file_states(planned)
-    changes: list[dict[str, Any]] = []
-    try:
-        for item in planned:
-            write_json(item.path, item.after)
-            load_jsonc(item.path)
-            changes.append(
-                {"action": "write", "kind": item.kind, "path": str(item.path)}
+        elif context_issue:
+            extension_snapshot = {
+                "profile": profile_name,
+                "returncode": None,
+                "extensions": [],
+                "error": f"Extension snapshot skipped: {context_issue}",
+            }
+        else:
+            extension_snapshot = extension_snapshot_for_profile(
+                code_bin,
+                None if matched_by == "default" else profile_name,
+                code_context_args(args),
             )
-        for extension in spec.get("extensions") or []:
-            changes.append(
-                run_extension_change(
-                    code_bin, spec["profile"], extension, True, context, args.force
-                )
-            )
-        for extension in spec.get("removeExtensions") or []:
-            changes.append(
-                run_extension_change(
-                    code_bin, spec["profile"], extension, False, context
-                )
-            )
-    except Exception as exc:
-        file_errors = restore_file_states(states)
-        extension_errors = (
-            rollback_touched_extensions(
-                code_bin, spec["profile"], context, initial_extensions, touched
-            )
-            if touched
-            else []
+        snapshot["extensionSnapshot"] = extension_snapshot
+        profile_dir = require_profile_dir(profile)
+        snapshot["profileFiles"] = snapshot_profile_files(
+            profile_dir, include_mcp=args.include_mcp
         )
-        detail = {
-            "error": str(exc),
-            "recoveryArchive": str(backup_path),
-            "fileRollbackErrors": file_errors,
-            "extensionRollbackErrors": extension_errors,
-        }
-        raise VscodeProfileError(
-            f"Apply failed; rollback attempted: {json.dumps(detail)}"
-        ) from exc
-    print(
-        json.dumps(
-            {
-                "applied": True,
-                **summary,
-                "changes": changes,
-                "recoveryArchive": str(backup_path),
-            },
-            indent=2,
-        )
-    )
+    elif args.include_default_settings:
+        snapshot["defaultSettings"] = load_jsonc(user_dir / "settings.json", default={})
+    if args.out:
+        out = expand_path(args.out)
+        write_json(out, snapshot)
+        print(out)
+    else:
+        print(json.dumps(snapshot, indent=2))
 
 
 def command_open_profile(args: argparse.Namespace) -> None:
     require_cli_context(args)
-    workspace = expand_path(args.workspace)
-    cmd = [
-        code_bin_for_variant(args.variant, args.code_bin),
-        str(workspace),
-        *code_context_args(args),
-        "--profile",
-        args.profile,
-    ]
+    workspace = expand_path(args.workspace) if args.workspace else None
+    cmd = [code_bin_for_variant(args.variant, args.code_bin)]
+    if workspace:
+        cmd.append(str(workspace))
+    cmd += [*code_context_args(args), "--profile", args.profile]
     if args.dry_run:
         print(
             json.dumps(
-                {"dryRun": True, "workspace": str(workspace), "command": cmd}, indent=2
+                {
+                    "dryRun": True,
+                    "profile": args.profile,
+                    "workspace": str(workspace) if workspace else None,
+                    "command": cmd,
+                },
+                indent=2,
             )
         )
         return
-    workspace.mkdir(parents=True, exist_ok=True)
+    if workspace:
+        workspace.mkdir(parents=True, exist_ok=True)
     proc = subprocess.run(
         cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
@@ -1644,7 +1084,11 @@ def command_open_profile(args: argparse.Namespace) -> None:
         )
     print(
         json.dumps(
-            {"opened": True, "profile": args.profile, "workspace": str(workspace)},
+            {
+                "opened": True,
+                "profile": args.profile,
+                "workspace": str(workspace) if workspace else None,
+            },
             indent=2,
         )
     )
@@ -1733,6 +1177,12 @@ def validate_restore_member_name(name: str, scope: str, profile_id: str | None) 
         ):
             raise VscodeProfileError(f"Unexpected profile backup member: {name}")
         return
+    if scope == "default-profile":
+        if len(parts) == 1 and parts[0] in SAFE_DEFAULT_FILES:
+            return
+        if len(parts) >= 2 and parts[0] == "snippets":
+            return
+        raise VscodeProfileError(f"Unexpected Default Profile backup member: {name}")
     if scope == "user-config":
         if len(parts) == 1 and parts[0] in SAFE_DEFAULT_FILES:
             return
@@ -1758,7 +1208,7 @@ def restore_members(
     profile_id = manifest.get("profileId")
     if scope == "profile":
         profile_id = validate_profile_id(profile_id)
-    elif scope != "user-config":
+    elif scope not in {"default-profile", "user-config"}:
         raise VscodeProfileError(f"Unsupported backup scope: {scope}")
     if len(set(declared)) != len(declared):
         raise VscodeProfileError("Backup manifest contains duplicate file entries")
@@ -1859,6 +1309,7 @@ def command_restore(args: argparse.Namespace) -> None:
                 if manifest.get("scope") == "profile"
                 else None,
                 profile_name=manifest.get("profile"),
+                default_only=manifest.get("scope") == "default-profile",
                 reason="pre-restore",
             )
         except VscodeProfileError:
@@ -1894,16 +1345,16 @@ def command_restore(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Safe helper for VS Code profile path discovery, backups, settings merges, snapshots, and extension management.",
+        description="Inspect and safely maintain VS Code profiles by display name.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
             """
             Examples:
-              python scripts/vscode_profile_manager.py paths --variant code
-              python scripts/vscode_profile_manager.py backup --variant code --out ~/Desktop/vscode-profile-backups
-              python scripts/vscode_profile_manager.py list-extensions --profile "Python" --show-versions
-              python scripts/vscode_profile_manager.py merge-settings --file ~/settings.json --set-json '{"editor.formatOnSave":true}'
-              python scripts/vscode_profile_manager.py generate-commands --spec assets/example-profile-spec.json
+              python3 scripts/vscode_profile_manager.py doctor --variant code
+              python3 scripts/vscode_profile_manager.py show-profile --profile "Python"
+              python3 scripts/vscode_profile_manager.py backup --profile "Python"
+              python3 scripts/vscode_profile_manager.py merge-settings --profile "Python" --set-json '{"editor.formatOnSave":true}'
+              python3 scripts/vscode_profile_manager.py list-extensions --profile "Python" --show-versions
             """
         ),
     )
@@ -1926,16 +1377,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=command_paths)
 
     p = sub.add_parser(
-        "list-profiles", help="List known profile IDs, names, and profile file paths"
+        "list-profiles", help="List known profile names, IDs, and configuration paths"
     )
     p.set_defaults(func=command_list_profiles)
 
     p = sub.add_parser(
-        "profile-setting-path",
-        help="Print profile settings.json path for a known profile ID",
+        "show-profile",
+        help="Resolve one profile name and show its files and extension context",
     )
-    p.add_argument("--profile-id", required=True)
-    p.set_defaults(func=command_profile_setting_path)
+    p.add_argument("--profile", required=True)
+    p.set_defaults(func=command_show_profile)
 
     p = sub.add_parser(
         "doctor",
@@ -1945,19 +1396,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "open-profile",
-        help="Create/open a profile for a workspace through the official CLI",
+        help="Create or open a profile through the official VS Code CLI",
     )
     p.add_argument("--profile", required=True)
-    p.add_argument("--workspace", required=True)
+    p.add_argument("--workspace")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=command_open_profile)
 
     p = sub.add_parser(
-        "backup", help="Create a timestamped zip backup of user/profile configuration"
+        "backup", help="Create a timestamped zip backup of profile configuration"
     )
-    p.add_argument("--profile-id", help="Back up only this profile folder")
     p.add_argument(
-        "--profile", help="Profile display name used for its extension snapshot"
+        "--profile",
+        help="Profile display name; omit to back up Default and all named profiles",
     )
     p.add_argument(
         "--skip-extensions",
@@ -1989,18 +1440,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=command_validate)
 
     p = sub.add_parser(
-        "validate-spec",
-        help="Validate a profile manifest and its target without changing state",
+        "merge-settings", help="Safely merge top-level settings into a named profile"
     )
-    p.add_argument("--spec", required=True)
-    p.add_argument("--allow-unverified-profile", action="store_true")
-    p.set_defaults(func=command_validate_spec)
-
-    p = sub.add_parser(
-        "merge-settings",
-        help="Safely merge top-level settings into a settings.json file",
+    target = p.add_mutually_exclusive_group(required=True)
+    target.add_argument("--profile", help="Profile display name or exact ID fallback")
+    target.add_argument(
+        "--file", help="Exact settings.json path for Default/custom file-only work"
     )
-    p.add_argument("--file", required=True)
     p.add_argument("--set-json", help="JSON object of settings to merge")
     p.add_argument(
         "--remove-key",
@@ -2047,26 +1493,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--continue-on-error", action="store_true")
     p.set_defaults(func=command_uninstall_extensions)
 
-    p = sub.add_parser("scaffold-spec", help="Create a profile manifest skeleton")
-    p.add_argument("--profile", required=True)
-    p.add_argument("--workspace")
-    p.add_argument("--out")
-    p.set_defaults(func=command_scaffold_spec)
-
     p = sub.add_parser(
-        "generate-commands",
-        help="Generate shell commands from a profile manifest without executing them",
-    )
-    p.add_argument("--spec", required=True)
-    p.set_defaults(func=command_generate_commands)
-
-    p = sub.add_parser(
-        "snapshot",
-        help="Create a JSON snapshot of profile extensions and optionally settings",
+        "snapshot", help="Create a JSON snapshot of one profile's files and extensions"
     )
     p.add_argument("--profile")
-    p.add_argument("--profile-id")
-    p.add_argument("--include-default-settings", action="store_true")
+    p.add_argument(
+        "--include-default-settings",
+        action="store_true",
+        help="Include Default settings when no --profile is supplied",
+    )
     p.add_argument(
         "--include-mcp",
         action="store_true",
@@ -2074,32 +1509,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--out")
     p.set_defaults(func=command_snapshot)
-
-    p = sub.add_parser(
-        "apply-spec", help="Apply a profile manifest; use --dry-run first"
-    )
-    p.add_argument("--spec", required=True)
-    p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--force", action="store_true")
-    p.add_argument(
-        "--confirm-destructive",
-        action="store_true",
-        help="Confirm removal fields after reviewing --dry-run",
-    )
-    p.add_argument(
-        "--allow-unverified-profile",
-        action="store_true",
-        help="Allow a profileId whose display name cannot be verified",
-    )
-    p.add_argument(
-        "--allow-comment-loss",
-        action="store_true",
-        help="Allow rewriting commented settings JSONC as plain JSON",
-    )
-    p.add_argument(
-        "--backup-dir", help="Directory for the automatic pre-apply recovery archive"
-    )
-    p.set_defaults(func=command_apply_spec)
 
     return parser
 

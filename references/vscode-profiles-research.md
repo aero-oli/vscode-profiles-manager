@@ -1,6 +1,6 @@
 # VS Code Profiles Reference
 
-Last verified against online documentation: 2026-08-09
+Last verified against online documentation: 2026-09-06
 
 ## Official behavior
 
@@ -28,13 +28,13 @@ Last verified against online documentation: 2026-08-09
 - Starting a server directly from `mcp.json` can bypass the normal trust prompt, so use the MCP management UI for review and trust decisions.
 - MCP enable/disable state is stored separately from `mcp.json`; a file-only backup cannot promise to restore it.
 
-## Helper design consequences
+## Agent and helper design consequences
 
 1. Treat the name-to-ID mapping read from `User/sync/profiles/lastSyncprofiles.json` as best-effort, read-only discovery because it is not a documented public interface.
-2. Require a direct-child profile ID or exact Settings JSON path, resolve and contain every target, and compare discovered display name to manifest name.
+2. Resolve display names to a direct-child profile ID, contain every file target, and use an exact internal ID only as an explicitly reported fallback.
 3. Back up only documented JSON/JSONC configuration and snippets. Do not restore internal databases, extension state files, workspace associations, global storage, or UI state.
 4. Capture extension versions with the official CLI as recovery evidence; use the CLI to change extensions.
-5. Make creation/association an explicit `open-profile` action. Routine manifest application must not open a GUI or silently associate a workspace.
+5. Make creation/opening an explicit `open-profile` action. Supplying a workspace intentionally associates it; omitting one avoids manufacturing a bootstrap folder.
 6. Refuse silent comment loss. Structured stdlib JSON writes cannot preserve JSONC comments, so require a targeted edit or explicit approval.
 7. Restore archives defensively: require a helper manifest, reject traversal and symlinks, limit sizes, preview first, back up current files, and write atomically.
 

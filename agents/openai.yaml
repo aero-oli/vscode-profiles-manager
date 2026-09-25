@@ -1,6 +1,6 @@
 interface:
   display_name: "VS Code Profiles Manager"
-  short_description: "Safely manage VS Code profiles and manifests"
-  default_prompt: "Use $vscode-profiles-manager to inspect and safely maintain my VS Code profiles."
+  short_description: "Create and directly manage VS Code profiles"
+  default_prompt: "Use $vscode-profiles-manager to manage my VS Code profiles from what I ask for."
 policy:
   allow_implicit_invocation: true

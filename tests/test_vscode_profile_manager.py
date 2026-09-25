@@ -31,13 +31,12 @@ def base_args(**overrides: object) -> argparse.Namespace:
         "user_data_dir": None,
         "code_bin": "code",
         "profile": None,
-        "profile_id": None,
         "skip_extensions": True,
         "out": None,
         "backup_dir": None,
-        "allow_unverified_profile": False,
         "allow_comment_loss": False,
-        "confirm_destructive": False,
+        "include_mcp": False,
+        "include_default_settings": False,
         "force": False,
         "dry_run": False,
     }
@@ -87,13 +86,11 @@ class JsoncTests(unittest.TestCase):
             path.write_text(
                 '{\n  // keep me\n  "editor.fontSize": 14\n}\n', encoding="utf-8"
             )
-            args = argparse.Namespace(
+            args = base_args(
                 file=str(path),
                 set_json='{"editor.fontSize":16}',
                 remove_key=[],
                 strategy="replace",
-                dry_run=False,
-                allow_comment_loss=False,
             )
 
             with self.assertRaises(vpm.VscodeProfileError):
@@ -183,119 +180,232 @@ class PathAndDiscoveryTests(unittest.TestCase):
             self.assertTrue(profile["hasMcp"])
             self.assertEqual(profile["mcpFile"], str(profile_dir / "mcp.json"))
 
-    def test_target_resolution_rejects_name_mismatch(self) -> None:
+    def test_name_first_resolution_and_id_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             user_dir = Path(tmp) / "User"
-            (user_dir / "profiles" / "abc123").mkdir(parents=True)
-            write_profile_names(user_dir, [{"id": "abc123", "name": "Actual"}])
+            for profile_id in ("abc123", "unmapped"):
+                (user_dir / "profiles" / profile_id).mkdir(parents=True)
+            write_profile_names(user_dir, [{"id": "abc123", "name": "Python"}])
 
-            with self.assertRaisesRegex(vpm.VscodeProfileError, "identity mismatch"):
-                vpm.resolve_profile_target(
-                    {"profile": "Wrong", "profileId": "abc123", "settings": {"x": 1}},
-                    user_dir,
-                )
+            named, named_match = vpm.resolve_profile_reference(user_dir, "python")
+            by_id, id_match = vpm.resolve_profile_reference(user_dir, "unmapped")
 
-    def test_target_resolution_rejects_external_settings_file(self) -> None:
+            self.assertEqual(named["id"], "abc123")
+            self.assertEqual(named_match, "name-case-insensitive")
+            self.assertEqual(by_id["id"], "unmapped")
+            self.assertEqual(id_match, "id")
+
+    def test_unknown_and_ambiguous_profiles_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             user_dir = Path(tmp) / "User"
-            external = Path(tmp) / "elsewhere" / "settings.json"
-            external.parent.mkdir(parents=True)
+            for profile_id in ("one", "two"):
+                (user_dir / "profiles" / profile_id).mkdir(parents=True)
+            write_profile_names(
+                user_dir,
+                [
+                    {"id": "one", "name": "Python"},
+                    {"id": "two", "name": "python"},
+                ],
+            )
 
-            with self.assertRaisesRegex(vpm.VscodeProfileError, "escapes"):
-                vpm.resolve_profile_target(
-                    {
+            with self.assertRaisesRegex(vpm.VscodeProfileError, "ambiguous"):
+                vpm.resolve_profile_reference(user_dir, "PYTHON")
+            with self.assertRaisesRegex(vpm.VscodeProfileError, "Known profiles"):
+                vpm.resolve_profile_reference(user_dir, "Rust")
+
+    def test_default_profile_resolves_to_user_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            user_dir = Path(tmp) / "User"
+            user_dir.mkdir()
+
+            profile, matched_by = vpm.resolve_profile_reference(user_dir, "Default")
+
+            self.assertEqual(matched_by, "default")
+            self.assertIsNone(profile["id"])
+            self.assertEqual(profile["settingsFile"], str(user_dir / "settings.json"))
+
+
+class DirectProfileTests(unittest.TestCase):
+    def create_target(self, root: Path, name: str = "Python") -> tuple[Path, Path]:
+        user_dir = root / "User"
+        profile_dir = user_dir / "profiles" / "abc123"
+        profile_dir.mkdir(parents=True)
+        write_profile_names(user_dir, [{"id": "abc123", "name": name}])
+        return user_dir, profile_dir
+
+    def test_show_profile_reports_paths_and_extensions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user_dir, profile_dir = self.create_target(root)
+            (profile_dir / "settings.json").write_text("{}", encoding="utf-8")
+            output = io.StringIO()
+            args = base_args(user_data_dir=str(root), profile="Python")
+
+            with (
+                mock.patch.object(
+                    vpm,
+                    "extension_snapshot_for_profile",
+                    return_value={
                         "profile": "Python",
-                        "settingsFile": str(external),
-                        "settings": {"x": 1},
+                        "returncode": 0,
+                        "extensions": ["publisher.extension@1.0.0"],
+                        "stderr": None,
                     },
-                    user_dir,
-                )
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                vpm.command_show_profile(args)
 
-    def test_unverified_profile_id_requires_explicit_override(self) -> None:
+            result = json.loads(output.getvalue())
+            self.assertEqual(result["matchedBy"], "name")
+            self.assertEqual(
+                result["profile"]["settingsFile"],
+                str((profile_dir / "settings.json").resolve()),
+            )
+            self.assertEqual(
+                result["extensionContext"]["extensions"],
+                ["publisher.extension@1.0.0"],
+            )
+
+    def test_merge_settings_resolves_profile_name_and_creates_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user_dir, profile_dir = self.create_target(root)
+            settings = profile_dir / "settings.json"
+            settings.write_text('{"editor.fontSize":14}\n', encoding="utf-8")
+            output = io.StringIO()
+            args = base_args(
+                user_dir=str(user_dir),
+                profile="Python",
+                file=None,
+                set_json='{"editor.fontSize":16}',
+                remove_key=[],
+                strategy="replace",
+            )
+
+            with contextlib.redirect_stdout(output):
+                vpm.command_merge_settings(args)
+
+            result = json.loads(output.getvalue())
+            self.assertEqual(result["matchedBy"], "name")
+            self.assertEqual(vpm.load_jsonc(settings)["editor.fontSize"], 16)
+            self.assertTrue(Path(result["backup"]).is_file())
+
+    def test_backup_resolves_name_without_exposing_id_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            user_dir, _ = self.create_target(Path(tmp))
+            args = base_args(
+                user_dir=str(user_dir),
+                profile="Python",
+                out=str(Path(tmp) / "backups"),
+            )
+
+            with (
+                mock.patch.object(
+                    vpm,
+                    "create_backup_archive",
+                    return_value=(Path(tmp) / "backup.zip", {"scope": "profile"}),
+                ) as create,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                vpm.command_backup(args)
+
+            self.assertEqual(create.call_args.kwargs["profile_id"], "abc123")
+            self.assertEqual(create.call_args.kwargs["profile_name"], "Python")
+
+    def test_backup_default_profile_is_focused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             user_dir = Path(tmp) / "User"
-            (user_dir / "profiles" / "abc123").mkdir(parents=True)
-            spec = {"profile": "Python", "profileId": "abc123", "settings": {"x": 1}}
-
-            with self.assertRaisesRegex(vpm.VscodeProfileError, "Could not verify"):
-                vpm.resolve_profile_target(spec, user_dir)
-            self.assertEqual(
-                vpm.resolve_profile_target(spec, user_dir, allow_unverified=True),
-                (user_dir / "profiles" / "abc123").resolve(),
+            named_dir = user_dir / "profiles" / "abc123"
+            named_dir.mkdir(parents=True)
+            (user_dir / "settings.json").write_text("{}", encoding="utf-8")
+            (named_dir / "settings.json").write_text("{}", encoding="utf-8")
+            args = base_args(
+                user_dir=str(user_dir),
+                profile="Default",
+                out=str(Path(tmp) / "backups"),
             )
 
+            with (
+                mock.patch.object(
+                    vpm,
+                    "create_backup_archive",
+                    return_value=(
+                        Path(tmp) / "backup.zip",
+                        {"scope": "default-profile"},
+                    ),
+                ) as create,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                vpm.command_backup(args)
 
-class ManifestTests(unittest.TestCase):
-    def test_unknown_fields_and_duplicates_are_rejected(self) -> None:
-        with self.assertRaisesRegex(vpm.VscodeProfileError, "Unknown"):
-            vpm.validate_manifest({"profile": "Python", "surprise": True})
-        with self.assertRaisesRegex(vpm.VscodeProfileError, "duplicates"):
-            vpm.validate_manifest({"profile": "Python", "extensions": ["a.b", "a.b"]})
+            self.assertTrue(create.call_args.kwargs["default_only"])
+            self.assertIsNone(create.call_args.kwargs["profile_id"])
+            self.assertEqual(create.call_args.kwargs["profile_name"], "Default")
 
-    def test_literal_mcp_secret_is_warned_but_variable_is_not(self) -> None:
-        warnings = vpm.validate_manifest(
-            {
-                "profile": "Python",
-                "mcpServers": {
-                    "unsafe": {"env": {"API_KEY": "literal"}},
-                    "safe": {"env": {"API_KEY": "${env:API_KEY}"}},
-                },
-            }
-        )
-
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("unsafe", warnings[0])
-
-    def test_manifest_rejects_vsix_and_case_insensitive_extension_duplicates(
-        self,
-    ) -> None:
-        with self.assertRaisesRegex(vpm.VscodeProfileError, "VSIX"):
-            vpm.validate_manifest(
-                {"profile": "Python", "extensions": ["/tmp/example.vsix"]}
-            )
-        with self.assertRaisesRegex(vpm.VscodeProfileError, "same extension ID"):
-            vpm.validate_manifest(
-                {
-                    "profile": "Python",
-                    "extensions": ["Publisher.Extension", "publisher.extension@1.2.3"],
-                }
-            )
-        with self.assertRaisesRegex(vpm.VscodeProfileError, "installed and removed"):
-            vpm.validate_manifest(
-                {
-                    "profile": "Python",
-                    "extensions": ["Publisher.Extension@1.2.3"],
-                    "removeExtensions": ["publisher.extension"],
-                }
-            )
-
-    def test_mcp_plan_merges_and_removes_named_servers(self) -> None:
+    def test_snapshot_resolves_files_and_omits_mcp_content_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            profile_dir = Path(tmp)
+            root = Path(tmp)
+            _, profile_dir = self.create_target(root)
+            (profile_dir / "settings.json").write_text(
+                '{"editor.formatOnSave":true}', encoding="utf-8"
+            )
+            (profile_dir / "keybindings.json").write_text(
+                '[{"key":"cmd+k","command":"example"}]', encoding="utf-8"
+            )
+            (profile_dir / "tasks.json").write_text(
+                '{"version":"2.0.0","tasks":[]}', encoding="utf-8"
+            )
+            snippets = profile_dir / "snippets"
+            snippets.mkdir()
+            (snippets / "python.json").write_text(
+                '{"Print":{"prefix":"pp","body":"print($1)"}}', encoding="utf-8"
+            )
             (profile_dir / "mcp.json").write_text(
-                json.dumps(
-                    {
-                        "servers": {
-                            "keep": {"url": "https://old"},
-                            "remove": {"command": "bad"},
-                        }
-                    }
-                ),
+                '{"servers":{"private":{"env":{"API_KEY":"secret"}}}}',
                 encoding="utf-8",
             )
-            spec = {
-                "profile": "Python",
-                "mcpServers": {"keep": {"url": "https://new"}},
-                "removeMcpServers": ["remove"],
-            }
+            args = base_args(user_data_dir=str(root), profile="Python")
+            output = io.StringIO()
 
-            planned = vpm.plan_profile_files(
-                spec, profile_dir, allow_comment_loss=False
-            )
+            with (
+                mock.patch.object(
+                    vpm,
+                    "extension_snapshot_for_profile",
+                    return_value={
+                        "profile": "Python",
+                        "returncode": 0,
+                        "extensions": [],
+                        "stderr": None,
+                    },
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                vpm.command_snapshot(args)
 
-            self.assertEqual(
-                planned[0].after["servers"], {"keep": {"url": "https://new"}}
-            )
+            result = json.loads(output.getvalue())
+            files = result["profileFiles"]
+            self.assertTrue(files["settings.json"]["editor.formatOnSave"])
+            self.assertEqual(files["keybindings.json"][0]["key"], "cmd+k")
+            self.assertEqual(files["tasks.json"]["version"], "2.0.0")
+            self.assertEqual(files["snippets"]["python.json"]["Print"]["prefix"], "pp")
+            self.assertIn("omitted", files["mcp.json"])
+            self.assertNotIn("secret", output.getvalue())
+
+    def test_open_profile_dry_run_does_not_require_workspace(self) -> None:
+        args = base_args(profile="Rust", workspace=None, dry_run=True)
+        output = io.StringIO()
+
+        with (
+            mock.patch.object(vpm.subprocess, "run") as run,
+            contextlib.redirect_stdout(output),
+        ):
+            vpm.command_open_profile(args)
+
+        result = json.loads(output.getvalue())
+        self.assertIsNone(result["workspace"])
+        self.assertEqual(result["command"], ["code", "--profile", "Rust"])
+        run.assert_not_called()
 
 
 class BackupRestoreTests(unittest.TestCase):
@@ -335,6 +445,30 @@ class BackupRestoreTests(unittest.TestCase):
             with zipfile.ZipFile(first) as archive:
                 self.assertIn(vpm.BACKUP_MANIFEST_NAME, archive.namelist())
                 self.assertIn("settings.json", archive.namelist())
+
+    def test_default_profile_backup_excludes_named_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user_dir = root / "User"
+            named_dir = user_dir / "profiles" / "abc123"
+            named_dir.mkdir(parents=True)
+            (user_dir / "settings.json").write_text("{}", encoding="utf-8")
+            (named_dir / "settings.json").write_text("{}", encoding="utf-8")
+
+            archive_path, manifest = vpm.create_backup_archive(
+                base_args(skip_extensions=True),
+                user_dir,
+                root / "backups",
+                profile_name="Default",
+                default_only=True,
+            )
+
+            self.assertEqual(manifest["scope"], "default-profile")
+            with zipfile.ZipFile(archive_path) as archive:
+                self.assertIn("settings.json", archive.namelist())
+                self.assertFalse(
+                    any(name.startswith("profiles/") for name in archive.namelist())
+                )
 
     def test_restore_rejects_traversal_member(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -476,212 +610,6 @@ class BackupRestoreTests(unittest.TestCase):
                 vpm.load_jsonc(profile_settings)["scope"], "profile-backup"
             )
             run.assert_not_called()
-
-
-class ApplySpecTests(unittest.TestCase):
-    def create_target(self, root: Path, name: str = "Python") -> tuple[Path, Path]:
-        user_dir = root / "User"
-        profile_dir = user_dir / "profiles" / "abc123"
-        profile_dir.mkdir(parents=True)
-        write_profile_names(user_dir, [{"id": "abc123", "name": name}])
-        return user_dir, profile_dir
-
-    def write_spec(self, root: Path, value: dict[str, object]) -> Path:
-        path = root / "profile.json"
-        path.write_text(json.dumps(value), encoding="utf-8")
-        return path
-
-    def test_apply_preflights_missing_target_before_mutation(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            spec_path = self.write_spec(
-                root,
-                {
-                    "profile": "Python",
-                    "extensions": ["ms-python.python"],
-                    "settings": {"x": 1},
-                },
-            )
-            args = base_args(spec=str(spec_path), user_dir=str(root / "User"))
-
-            with (
-                mock.patch.object(vpm.subprocess, "run") as run,
-                self.assertRaises(vpm.VscodeProfileError),
-            ):
-                vpm.command_apply_spec(args)
-
-            run.assert_not_called()
-
-    def test_apply_requires_confirmation_for_removals(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            user_dir, _ = self.create_target(root)
-            spec_path = self.write_spec(
-                root,
-                {
-                    "profile": "Python",
-                    "profileId": "abc123",
-                    "removeSettings": ["editor.fontSize"],
-                },
-            )
-            args = base_args(spec=str(spec_path), user_dir=str(user_dir))
-
-            with (
-                mock.patch.object(vpm, "create_backup_archive") as backup,
-                self.assertRaisesRegex(vpm.VscodeProfileError, "confirm-destructive"),
-            ):
-                vpm.command_apply_spec(args)
-
-            backup.assert_not_called()
-
-    def test_apply_writes_files_without_opening_a_gui(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            user_dir, profile_dir = self.create_target(root)
-            spec_path = self.write_spec(
-                root,
-                {
-                    "profile": "Python",
-                    "profileId": "abc123",
-                    "settings": {"editor.formatOnSave": True},
-                    "keybindings": [
-                        {
-                            "key": "cmd+k",
-                            "command": "workbench.action.clearEditorHistory",
-                        }
-                    ],
-                    "tasks": {"version": "2.0.0", "tasks": []},
-                    "snippets": {
-                        "python.json": {"Print": {"prefix": "pp", "body": "print($1)"}}
-                    },
-                    "mcpServers": {
-                        "docs": {"type": "http", "url": "https://example.test/mcp"}
-                    },
-                },
-            )
-            args = base_args(
-                spec=str(spec_path),
-                user_dir=None,
-                user_data_dir=str(root),
-                backup_dir=str(root / "backups"),
-            )
-
-            with mock.patch.object(
-                vpm, "create_backup_archive", return_value=(root / "recovery.zip", {})
-            ):
-                with mock.patch.object(vpm.subprocess, "run") as run:
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        vpm.command_apply_spec(args)
-
-            run.assert_not_called()
-            self.assertTrue(
-                vpm.load_jsonc(profile_dir / "settings.json")["editor.formatOnSave"]
-            )
-            self.assertEqual(
-                vpm.load_jsonc(profile_dir / "keybindings.json")[0]["key"], "cmd+k"
-            )
-            self.assertEqual(
-                vpm.load_jsonc(profile_dir / "tasks.json")["version"], "2.0.0"
-            )
-            self.assertEqual(
-                vpm.load_jsonc(profile_dir / "snippets" / "python.json")["Print"][
-                    "prefix"
-                ],
-                "pp",
-            )
-            self.assertIn("docs", vpm.load_jsonc(profile_dir / "mcp.json")["servers"])
-
-    def test_apply_rolls_back_file_when_extension_change_fails(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            user_dir, profile_dir = self.create_target(root)
-            settings = profile_dir / "settings.json"
-            settings.write_text('{"editor.fontSize":14}\n', encoding="utf-8")
-            spec_path = self.write_spec(
-                root,
-                {
-                    "profile": "Python",
-                    "profileId": "abc123",
-                    "settings": {"editor.fontSize": 18},
-                    "extensions": ["publisher.extension"],
-                },
-            )
-            args = base_args(
-                spec=str(spec_path),
-                user_dir=None,
-                user_data_dir=str(root),
-                backup_dir=str(root / "backups"),
-            )
-            initial = {"returncode": 0, "extensions": [], "stderr": None}
-
-            with (
-                mock.patch.object(
-                    vpm, "extension_snapshot_for_profile", return_value=initial
-                ),
-                mock.patch.object(
-                    vpm,
-                    "create_backup_archive",
-                    return_value=(root / "recovery.zip", {}),
-                ),
-                mock.patch.object(
-                    vpm,
-                    "run_extension_change",
-                    side_effect=vpm.VscodeProfileError("install failed"),
-                ),
-                mock.patch.object(vpm, "rollback_touched_extensions", return_value=[]),
-            ):
-                with self.assertRaisesRegex(
-                    vpm.VscodeProfileError, "rollback attempted"
-                ):
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        vpm.command_apply_spec(args)
-
-            self.assertEqual(vpm.load_jsonc(settings)["editor.fontSize"], 14)
-
-    def test_dry_run_is_read_only_and_reports_diff(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            user_dir, profile_dir = self.create_target(root)
-            settings = profile_dir / "settings.json"
-            settings.write_text('{"editor.fontSize":14}\n', encoding="utf-8")
-            spec_path = self.write_spec(
-                root,
-                {
-                    "profile": "Python",
-                    "profileId": "abc123",
-                    "settings": {"editor.fontSize": 18},
-                },
-            )
-            args = base_args(spec=str(spec_path), user_dir=str(user_dir), dry_run=True)
-            output = io.StringIO()
-
-            with (
-                contextlib.redirect_stdout(output),
-                mock.patch.object(vpm.subprocess, "run") as run,
-            ):
-                vpm.command_apply_spec(args)
-
-            run.assert_not_called()
-            self.assertIn("editor.fontSize", output.getvalue())
-            self.assertEqual(vpm.load_jsonc(settings)["editor.fontSize"], 14)
-
-    def test_dry_run_explains_when_profile_file_target_is_missing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            spec_path = self.write_spec(
-                root, {"profile": "Python", "settings": {"editor.fontSize": 18}}
-            )
-            args = base_args(
-                spec=str(spec_path), user_dir=str(root / "User"), dry_run=True
-            )
-            output = io.StringIO()
-
-            with contextlib.redirect_stdout(output):
-                vpm.command_apply_spec(args)
-
-            result = json.loads(output.getvalue())
-            self.assertIsNone(result["profileDir"])
-            self.assertIn("need profileId or settingsFile", result["warnings"][0])
 
 
 if __name__ == "__main__":
