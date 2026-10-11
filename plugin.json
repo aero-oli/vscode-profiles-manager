@@ -1,0 +1,29 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "vscode-profiles-manager",
+  "version": "0.1.0",
+  "description": "Create, inspect, configure, back up, and restore VS Code profiles from natural-language requests.",
+  "author": {
+    "name": "aero-oli",
+    "url": "https://github.com/aero-oli"
+  },
+  "repository": "https://github.com/aero-oli/vscode-profiles-manager",
+  "keywords": ["vscode", "profiles", "settings", "extensions", "backups"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "VS Code Profiles Manager",
+        "shortDescription": "Create and safely manage VS Code profiles",
+        "longDescription": "Manage VS Code, VS Code Insiders, and VSCodium profiles by name, including settings, extensions, backups, and restore previews.",
+        "developerName": "aero-oli",
+        "category": "Developer Tools",
+        "capabilities": ["Read", "Write"],
+        "defaultPrompt": [
+          "Inspect my VS Code profiles and their settings.",
+          "Create a VS Code profile for Python development.",
+          "Back up my VS Code profile before changing its settings."
+        ]
+      }
+    }
+  }
+}

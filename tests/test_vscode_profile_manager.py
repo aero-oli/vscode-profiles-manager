@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "scripts" / "vscode_profile_manager.py"
+SCRIPT = ROOT / "skills" / "vscode-profiles-manager" / "scripts" / "vscode_profile_manager.py"
 module_spec = importlib.util.spec_from_file_location("vscode_profile_manager", SCRIPT)
 vpm = importlib.util.module_from_spec(module_spec)
 assert module_spec.loader is not None
