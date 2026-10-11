@@ -72,6 +72,11 @@ def user_dir_for_variant(
     user_dir_override: str | None = None,
     user_data_dir: str | None = None,
 ) -> Path:
+    if user_dir_override and user_data_dir:
+        if expand_path(user_dir_override) != expand_path(user_data_dir) / "User":
+            raise VscodeProfileError(
+                "Conflicting --user-dir and --user-data-dir; select one instance."
+            )
     if user_dir_override:
         return expand_path(user_dir_override)
     if user_data_dir:
@@ -109,6 +114,7 @@ def user_dir_from_args(args: argparse.Namespace, variant: str | None = None) -> 
 
 
 def code_context_args(args: argparse.Namespace) -> list[str]:
+    user_dir_from_args(args)  # Reject conflicting directory overrides for CLI work too.
     user_data_dir = getattr(args, "user_data_dir", None)
     return ["--user-data-dir", str(expand_path(user_data_dir))] if user_data_dir else []
 
@@ -117,6 +123,7 @@ def cli_context_issue(
     args: argparse.Namespace, variant: str | None = None
 ) -> str | None:
     """Explain when the VS Code CLI cannot target the helper's selected User directory."""
+    user_dir_from_args(args, variant)
     if getattr(args, "user_data_dir", None) or not getattr(args, "user_dir", None):
         return None
     selected_variant = variant or args.variant
@@ -138,7 +145,8 @@ def require_cli_context(args: argparse.Namespace, variant: str | None = None) ->
 
 def validate_profile_id(profile_id: str) -> str:
     if (
-        not profile_id
+        not isinstance(profile_id, str)
+        or not profile_id
         or profile_id in {".", ".."}
         or "/" in profile_id
         or "\\" in profile_id
@@ -191,14 +199,20 @@ def strip_jsonc(text: str) -> str:
             i += 1
             continue
         if ch == "/" and nxt == "/":
+            out.append(" ")
             i += 2
             while i < len(text) and text[i] not in "\r\n":
                 i += 1
             continue
         if ch == "/" and nxt == "*":
+            out.append(" ")
             i += 2
             while i + 1 < len(text) and not (text[i] == "*" and text[i + 1] == "/"):
+                if text[i] in "\r\n":
+                    out.append(text[i])
                 i += 1
+            if i + 1 >= len(text):
+                raise VscodeProfileError("Unterminated JSONC block comment")
             i += 2
             continue
         out.append(ch)
@@ -241,18 +255,21 @@ def strip_trailing_commas(text: str) -> str:
     return "".join(out)
 
 
+def parse_jsonc(text: str, label: str, default: Any | None = None) -> Any:
+    if not text.strip():
+        return default if default is not None else {}
+    try:
+        return json.loads(strip_jsonc(text))
+    except (json.JSONDecodeError, VscodeProfileError) as exc:
+        raise VscodeProfileError(f"Invalid JSON/JSONC in {label}: {exc}") from exc
+
+
 def load_jsonc(path: Path, default: Any | None = None) -> Any:
     if not path.exists():
         if default is not None:
             return default
         raise FileNotFoundError(path)
-    text = path.read_text(encoding="utf-8")
-    if not text.strip():
-        return default if default is not None else {}
-    try:
-        return json.loads(strip_jsonc(text))
-    except json.JSONDecodeError as exc:
-        raise VscodeProfileError(f"Invalid JSON/JSONC in {path}: {exc}") from exc
+    return parse_jsonc(path.read_text(encoding="utf-8"), str(path), default)
 
 
 def has_jsonc_comments(text: str) -> bool:
@@ -375,7 +392,43 @@ def command_paths(args: argparse.Namespace) -> None:
     print(json.dumps(build_paths(args), indent=2))
 
 
-def read_sync_profile_names(user_dir: Path) -> dict[str, str]:
+def read_local_profiles(user_dir: Path) -> dict[str, dict[str, Any]] | None:
+    """Read VS Code's registered profiles without changing its internal state."""
+    path = user_dir / "globalStorage" / "storage.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        profiles = raw.get("userDataProfiles", [])
+        if not isinstance(profiles, list):
+            return None
+    except (OSError, ValueError, AttributeError):
+        return None
+    result: dict[str, dict[str, Any]] = {}
+    for profile in profiles:
+        if not isinstance(profile, dict) or not isinstance(profile.get("name"), str):
+            continue
+        location = profile.get("location")
+        if isinstance(location, dict):
+            # Older installations stored a serialized file URI instead of a folder ID.
+            if location.get("scheme") != "file" or location.get("authority"):
+                continue
+            uri_path = location.get("path")
+            if not isinstance(uri_path, str):
+                continue
+            if os.name == "nt" and uri_path.startswith("/"):
+                uri_path = uri_path[1:]
+            profile_path = Path(uri_path)
+            if profile_path.parent.resolve() != (user_dir / "profiles").resolve():
+                continue
+            location = profile_path.name
+        try:
+            profile_id = validate_profile_id(location)
+        except VscodeProfileError:
+            continue
+        result[profile_id] = profile
+    return result
+
+
+def read_sync_profiles(user_dir: Path) -> dict[str, dict[str, Any]]:
     sync_path = user_dir / "sync" / "profiles" / "lastSyncprofiles.json"
     if not sync_path.exists():
         return {}
@@ -388,21 +441,30 @@ def read_sync_profile_names(user_dir: Path) -> dict[str, str]:
         return {}
     if not isinstance(profiles, list):
         return {}
-    names: dict[str, str] = {}
+    result: dict[str, dict[str, Any]] = {}
     for profile in profiles:
         if not isinstance(profile, dict):
             continue
         profile_id = profile.get("id")
         name = profile.get("name")
         if isinstance(profile_id, str) and isinstance(name, str):
-            names[profile_id] = name
-    return names
+            try:
+                validate_profile_id(profile_id)
+            except VscodeProfileError:
+                continue
+            result[profile_id] = profile
+    return result
 
 
 def discover_profiles(user_dir: Path) -> list[dict[str, Any]]:
     profiles_dir = user_dir / "profiles"
-    names = read_sync_profile_names(user_dir)
-    profile_ids: set[str] = set(names)
+    metadata = read_local_profiles(user_dir)
+    metadata_source = "local-state"
+    if metadata is None:
+        metadata = read_sync_profiles(user_dir)
+        metadata_source = "settings-sync"
+    names = {profile_id: item["name"] for profile_id, item in metadata.items()}
+    profile_ids: set[str] = set(metadata)
     if profiles_dir.exists():
         profile_ids.update(
             path.name
@@ -415,30 +477,29 @@ def discover_profiles(user_dir: Path) -> list[dict[str, Any]]:
         profile_ids, key=lambda value: (names.get(value) or value).lower()
     ):
         profile_dir = profiles_dir / profile_id
-        source = "profiles-dir"
-        if profile_id in names and profile_dir.exists():
-            source = "profiles-dir+settings-sync"
-        elif profile_id in names:
-            source = "settings-sync"
-        profiles.append(
-            {
-                "id": profile_id,
-                "name": names.get(profile_id),
-                "source": source,
-                "profileDir": str(profile_dir),
-                "profileDirExists": profile_dir.exists(),
-                "settingsFile": str(profile_dir / "settings.json"),
-                "keybindingsFile": str(profile_dir / "keybindings.json"),
-                "tasksFile": str(profile_dir / "tasks.json"),
-                "mcpFile": str(profile_dir / "mcp.json"),
-                "snippetsDir": str(profile_dir / "snippets"),
-                "hasSettings": (profile_dir / "settings.json").exists(),
-                "hasKeybindings": (profile_dir / "keybindings.json").exists(),
-                "hasTasks": (profile_dir / "tasks.json").exists(),
-                "hasMcp": (profile_dir / "mcp.json").exists(),
-                "hasSnippets": (profile_dir / "snippets").exists(),
-            }
-        )
+        flags = metadata.get(profile_id, {}).get("useDefaultFlags", {})
+        flags = flags if isinstance(flags, dict) else {}
+        flags = {key: True for key, value in flags.items() if value is True}
+        profile = {
+            "id": profile_id,
+            "name": names.get(profile_id),
+            "source": metadata_source if profile_id in metadata else "profiles-dir",
+            "profileDir": str(profile_dir),
+            "profileDirExists": profile_dir.exists(),
+            "useDefaultFlags": flags,
+            "sharedWithDefault": sorted(flags),
+        }
+        for category, filename, path_key, exists_key in (
+            ("settings", "settings.json", "settingsFile", "hasSettings"),
+            ("keybindings", "keybindings.json", "keybindingsFile", "hasKeybindings"),
+            ("tasks", "tasks.json", "tasksFile", "hasTasks"),
+            ("mcp", "mcp.json", "mcpFile", "hasMcp"),
+            ("snippets", "snippets", "snippetsDir", "hasSnippets"),
+        ):
+            path = (user_dir if flags.get(category) else profile_dir) / filename
+            profile[path_key] = str(path)
+            profile[exists_key] = path.exists()
+        profiles.append(profile)
     return profiles
 
 
@@ -457,6 +518,8 @@ def default_profile_info(user_dir: Path) -> dict[str, Any]:
         "id": None,
         "name": "Default",
         "source": "default",
+        "useDefaultFlags": {},
+        "sharedWithDefault": [],
         "profileDir": str(user_dir),
         "profileDirExists": user_dir.exists(),
         "settingsFile": str(user_dir / "settings.json"),
@@ -508,8 +571,10 @@ def resolve_profile_reference(
     raise VscodeProfileError(f"Profile not found: {reference!r}.{suffix}")
 
 
-def require_profile_dir(profile: dict[str, Any]) -> Path:
-    profile_dir = Path(profile["profileDir"]).resolve()
+def require_profile_dir(profile: dict[str, Any], user_dir: Path) -> Path:
+    profile_dir = ensure_within(
+        Path(profile["profileDir"]), user_dir, "profile directory"
+    )
     if not profile.get("profileDirExists"):
         raise VscodeProfileError(
             f"Profile files do not exist locally for {profile.get('name') or profile.get('id')!r}"
@@ -748,8 +813,20 @@ def create_backup_archive(
         "reason": reason,
         "userDir": str(user_dir),
         "files": [item.archive_name for item in items],
+        "sharedWithDefault": (
+            next(
+                (
+                    p["sharedWithDefault"]
+                    for p in discover_profiles(user_dir)
+                    if p["id"] == profile_id
+                ),
+                [],
+            )
+            if profile_id
+            else []
+        ),
         "extensionsSnapshot": EXTENSIONS_SNAPSHOT_NAME if extension_snapshots else None,
-        "restoreNote": "File restore does not reconcile installed extensions; use the snapshot as recovery evidence.",
+        "restoreNote": "Restores archived files only, not profile registration, inheritance, or extensions. Back up Default separately before changing shared resources.",
     }
     if zip_path.exists():
         raise VscodeProfileError(f"Backup destination already exists: {zip_path}")
@@ -793,11 +870,11 @@ def command_backup(args: argparse.Namespace) -> None:
     if args.profile:
         profile, matched_by = resolve_profile_reference(user_dir, args.profile)
         if matched_by == "default":
-            require_profile_dir(profile)
+            require_profile_dir(profile, user_dir)
             default_only = True
             profile_name = "Default"
         else:
-            require_profile_dir(profile)
+            require_profile_dir(profile, user_dir)
             profile_id = validate_profile_id(profile["id"])
             profile_name = profile.get("name")
     out_dir = expand_path(args.out or (Path.home() / "Desktop" / BACKUP_DIR_NAME))
@@ -828,14 +905,23 @@ def command_validate(args: argparse.Namespace) -> None:
 
 
 def command_merge_settings(args: argparse.Namespace) -> None:
+    user_dir = user_dir_from_args(args)
     if args.profile:
-        user_dir = user_dir_from_args(args)
         profile, matched_by = resolve_profile_reference(user_dir, args.profile)
-        profile_dir = require_profile_dir(profile)
-        path = profile_dir / "settings.json"
+        require_profile_dir(profile, user_dir)
+        if profile.get("useDefaultFlags", {}).get("settings") and not getattr(
+            args, "allow_shared_settings", False
+        ):
+            raise VscodeProfileError(
+                "This profile uses Default settings. Make settings independent in the "
+                "Profiles editor, or use --allow-shared-settings to change Default "
+                "for every profile sharing its settings."
+            )
+        path = Path(profile["settingsFile"])
     else:
         matched_by = "file"
         path = expand_path(args.file)
+    path = ensure_within(path, user_dir, "settings file")
     updates: dict[str, Any] = {}
     if args.set_json:
         loaded = json.loads(args.set_json)
@@ -958,21 +1044,25 @@ def command_uninstall_extensions(args: argparse.Namespace) -> None:
 
 
 def snapshot_profile_files(
-    profile_dir: Path, include_mcp: bool = False
+    profile: dict[str, Any], include_mcp: bool = False
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for filename in ("settings.json", "keybindings.json", "tasks.json"):
-        path = profile_dir / filename
+    for filename, path_key in (
+        ("settings.json", "settingsFile"),
+        ("keybindings.json", "keybindingsFile"),
+        ("tasks.json", "tasksFile"),
+    ):
+        path = Path(profile[path_key])
         if path.exists():
             result[filename] = load_jsonc(path)
-    snippets_dir = profile_dir / "snippets"
+    snippets_dir = Path(profile["snippetsDir"])
     if snippets_dir.exists():
         result["snippets"] = {
             child.name: load_jsonc(child)
             for child in sorted(snippets_dir.iterdir())
             if child.is_file() and not child.is_symlink()
         }
-    mcp_path = profile_dir / "mcp.json"
+    mcp_path = Path(profile["mcpFile"])
     if mcp_path.exists():
         result["mcp.json"] = (
             load_jsonc(mcp_path)
@@ -1039,9 +1129,9 @@ def command_snapshot(args: argparse.Namespace) -> None:
                 code_context_args(args),
             )
         snapshot["extensionSnapshot"] = extension_snapshot
-        profile_dir = require_profile_dir(profile)
+        require_profile_dir(profile, user_dir)
         snapshot["profileFiles"] = snapshot_profile_files(
-            profile_dir, include_mcp=args.include_mcp
+            profile, include_mcp=args.include_mcp
         )
     elif args.include_default_settings:
         snapshot["defaultSettings"] = load_jsonc(user_dir / "settings.json", default={})
@@ -1073,8 +1163,8 @@ def command_open_profile(args: argparse.Namespace) -> None:
             )
         )
         return
-    if workspace:
-        workspace.mkdir(parents=True, exist_ok=True)
+    if workspace and not workspace.exists():
+        raise VscodeProfileError(f"Workspace path does not exist: {workspace}")
     proc = subprocess.run(
         cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
@@ -1110,9 +1200,9 @@ def command_doctor(args: argparse.Namespace) -> None:
         "userDir": str(user_dir),
         "userDirExists": user_dir.exists(),
         "profileCount": len(discover_profiles(user_dir)),
-        "userDataDir": str(expand_path(args.user_data_dir))
-        if args.user_data_dir
-        else None,
+        "userDataDir": (
+            str(expand_path(args.user_data_dir)) if args.user_data_dir else None
+        ),
         "cliContextWarning": cli_context_issue(args),
     }
     if resolved_bin:
@@ -1281,6 +1371,11 @@ def command_restore(args: argparse.Namespace) -> None:
                     f"Profile identity mismatch: archive is {manifest['profile']!r}, current ID is {current['name']!r}"
                 )
         members = restore_members(zf, manifest, user_dir)
+        # Read and validate every payload before a backup or any file changes.
+        payloads = [(target, zf.read(info)) for info, target in members]
+        for target, content in payloads:
+            if target.suffix in {".json", ".jsonc", ".code-snippets"}:
+                parse_jsonc(content.decode("utf-8"), str(target))
         plan = {
             "archive": str(archive),
             "targetUserDir": str(user_dir),
@@ -1298,22 +1393,22 @@ def command_restore(args: argparse.Namespace) -> None:
         backup_args.profile = manifest.get("profile")
         backup_args.profile_id = manifest.get("profileId")
         backup_args.skip_extensions = False
-        try:
+        backup_profile_id = (
+            manifest.get("profileId") if manifest.get("scope") == "profile" else None
+        )
+        default_only = manifest.get("scope") == "default-profile"
+        if collect_backup_items(user_dir, backup_profile_id, default_only=default_only):
             recovery_path, _ = create_backup_archive(
                 backup_args,
                 user_dir,
                 expand_path(
                     args.backup_dir or (Path.home() / "Desktop" / BACKUP_DIR_NAME)
                 ),
-                profile_id=manifest.get("profileId")
-                if manifest.get("scope") == "profile"
-                else None,
+                profile_id=backup_profile_id,
                 profile_name=manifest.get("profile"),
-                default_only=manifest.get("scope") == "default-profile",
+                default_only=default_only,
                 reason="pre-restore",
             )
-        except VscodeProfileError:
-            recovery_path = None
         states = [
             FileState(
                 target,
@@ -1324,8 +1419,8 @@ def command_restore(args: argparse.Namespace) -> None:
             for _, target in members
         ]
         try:
-            for info, target in members:
-                atomic_write_bytes(target, zf.read(info), 0o600)
+            for target, content in payloads:
+                atomic_write_bytes(target, content, 0o600)
         except Exception as exc:
             rollback_errors = restore_file_states(states)
             raise VscodeProfileError(
@@ -1347,16 +1442,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Inspect and safely maintain VS Code profiles by display name.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=textwrap.dedent(
-            """
+        epilog=textwrap.dedent("""
             Examples:
               python3 scripts/vscode_profile_manager.py doctor --variant code
               python3 scripts/vscode_profile_manager.py show-profile --profile "Python"
               python3 scripts/vscode_profile_manager.py backup --profile "Python"
               python3 scripts/vscode_profile_manager.py merge-settings --profile "Python" --set-json '{"editor.formatOnSave":true}'
               python3 scripts/vscode_profile_manager.py list-extensions --profile "Python" --show-versions
-            """
-        ),
+            """),
     )
     parser.add_argument(
         "--variant",
@@ -1445,7 +1538,7 @@ def build_parser() -> argparse.ArgumentParser:
     target = p.add_mutually_exclusive_group(required=True)
     target.add_argument("--profile", help="Profile display name or exact ID fallback")
     target.add_argument(
-        "--file", help="Exact settings.json path for Default/custom file-only work"
+        "--file", help="Exact settings.json path inside the selected User directory"
     )
     p.add_argument("--set-json", help="JSON object of settings to merge")
     p.add_argument(
@@ -1466,6 +1559,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-comment-loss",
         action="store_true",
         help="Allow rewriting a commented JSONC file as plain JSON",
+    )
+    p.add_argument(
+        "--allow-shared-settings",
+        action="store_true",
+        help="Change Default settings used by this profile and other sharing profiles",
     )
     p.set_defaults(func=command_merge_settings)
 

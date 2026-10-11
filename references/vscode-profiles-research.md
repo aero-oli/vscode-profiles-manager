@@ -1,6 +1,6 @@
 # VS Code Profiles Reference
 
-Last verified against online documentation: 2026-09-06
+Profile resolution and CLI behavior rechecked: 2026-10-11. Other notes last checked: 2026-09-06.
 
 ## Official behavior
 
@@ -30,7 +30,7 @@ Last verified against online documentation: 2026-09-06
 
 ## Agent and helper design consequences
 
-1. Treat the name-to-ID mapping read from `User/sync/profiles/lastSyncprofiles.json` as best-effort, read-only discovery because it is not a documented public interface.
+1. Read registration from `User/globalStorage/storage.json` (`userDataProfiles`) first. Use `User/sync/profiles/lastSyncprofiles.json` only when local metadata is unavailable. These are internal, read-only discovery sources; use the Profiles UI when metadata cannot establish identity.
 2. Resolve display names to a direct-child profile ID, contain every file target, and use an exact internal ID only as an explicitly reported fallback.
 3. Back up only documented JSON/JSONC configuration and snippets. Do not restore internal databases, extension state files, workspace associations, global storage, or UI state.
 4. Capture extension versions with the official CLI as recovery evidence; use the CLI to change extensions.
@@ -38,13 +38,13 @@ Last verified against online documentation: 2026-09-06
 6. Refuse silent comment loss. Structured stdlib JSON writes cannot preserve JSONC comments, so require a targeted edit or explicit approval.
 7. Restore archives defensively: require a helper manifest, reject traversal and symlinks, limit sizes, preview first, back up current files, and write atomically.
 
-## Existing alternatives
+## Shared resources and restore
 
-- Native VS Code Profiles and Settings Sync are the primary interactive solution.
-- Nix Home Manager offers declarative `programs.vscode.profiles.<name>` settings, extensions, keybindings, snippets, tasks, and MCP configuration for Nix-managed systems.
-- Dev Containers are a better fit for repository-controlled runtimes and remote extension installation.
-- Extension Profiles 3000 is complementary when multiple composable extension groups per workspace are more useful than a single native profile.
-- Microsoft's `jsonc-parser` package is the preferred optional foundation if this helper later adopts comment-preserving targeted edits.
+- `show-profile` uses `useDefaultFlags` to report effective paths; `snapshot` reads those resources. A profile backup stores files in its own directory and reports shared categories, so back up Default before any shared edit.
+- For a change restricted to one profile, make its category independent in the Profiles editor. For an authorized shared settings change, use `backup --profile Default`, then `merge-settings --profile NAME --allow-shared-settings --set-json JSON`.
+- Preview a helper archive with `restore --archive PATH`. Inspect its target, files, and identity before applying `restore --archive PATH --confirm`. Close VS Code first for a multi-file restore.
+- Restore validates JSON/JSONC and snippet payloads before any mutation and backs up existing configuration. An empty configuration target needs no recovery archive; other backup failures stop the restore.
+- Restore overlays archived files at their original paths. It does not remove extra files or recreate profiles, inheritance, associations, or extension state. Use native `.code-profile` import/export for transferring a profile to another installation.
 
 ## Primary sources
 
@@ -54,5 +54,5 @@ Last verified against online documentation: 2026-09-06
 - VS Code Settings Sync: https://code.visualstudio.com/docs/configure/settings-sync
 - VS Code MCP servers: https://code.visualstudio.com/docs/agent-customization/mcp-servers
 - VS Code Dev Containers: https://code.visualstudio.com/docs/devcontainers/create-dev-container
-- Home Manager VS Code options: https://home-manager.dev/manual/unstable/options/home-manager/programs/vscode.html
-- Microsoft JSONC parser: https://github.com/microsoft/node-jsonc-parser
+- VS Code profile registration: https://github.com/microsoft/vscode/blob/main/src/vs/platform/userDataProfile/node/userDataProfile.ts
+- VS Code effective profile resources: https://github.com/microsoft/vscode/blob/main/src/vs/platform/userDataProfile/common/userDataProfile.ts

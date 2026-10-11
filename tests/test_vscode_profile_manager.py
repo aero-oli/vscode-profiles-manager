@@ -7,13 +7,13 @@ import io
 import json
 import os
 import platform
+import subprocess
 import sys
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
 from unittest import mock
-
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "vscode_profile_manager.py"
@@ -53,7 +53,22 @@ def write_profile_names(user_dir: Path, profiles: list[dict[str, str]]) -> None:
     )
 
 
+def write_local_profiles(user_dir: Path, profiles: list[dict]) -> Path:
+    path = user_dir / "globalStorage" / "storage.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"userDataProfiles": profiles}), encoding="utf-8")
+    return path
+
+
 class JsoncTests(unittest.TestCase):
+    def test_invalid_jsonc_comments_are_rejected(self) -> None:
+        for text in ('{"value":1/*comment*/2}', '{"value":1}/*unterminated'):
+            with self.subTest(text=text), self.assertRaises(vpm.VscodeProfileError):
+                vpm.parse_jsonc(text, "settings.json")
+        self.assertEqual(
+            vpm.parse_jsonc('{/* valid */"value":1,}', "settings.json"), {"value": 1}
+        )
+
     def test_strip_jsonc_preserves_comment_markers_and_commas_inside_strings(
         self,
     ) -> None:
@@ -87,13 +102,14 @@ class JsoncTests(unittest.TestCase):
                 '{\n  // keep me\n  "editor.fontSize": 14\n}\n', encoding="utf-8"
             )
             args = base_args(
+                user_dir=tmp,
                 file=str(path),
                 set_json='{"editor.fontSize":16}',
                 remove_key=[],
                 strategy="replace",
             )
 
-            with self.assertRaises(vpm.VscodeProfileError):
+            with self.assertRaisesRegex(vpm.VscodeProfileError, "contains comments"):
                 vpm.command_merge_settings(args)
 
             self.assertIn("// keep me", path.read_text(encoding="utf-8"))
@@ -111,6 +127,92 @@ class JsoncTests(unittest.TestCase):
 
 
 class PathAndDiscoveryTests(unittest.TestCase):
+    def test_directory_overrides_must_target_the_same_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            args = base_args(user_dir=str(root / "wrong"), user_data_dir=str(root))
+            for check in (
+                vpm.user_dir_from_args,
+                vpm.code_context_args,
+                vpm.require_cli_context,
+            ):
+                with (
+                    self.subTest(check=check.__name__),
+                    self.assertRaisesRegex(vpm.VscodeProfileError, "Conflicting"),
+                ):
+                    check(args)
+            args.user_dir = str(root / "User")
+            self.assertEqual(vpm.user_dir_from_args(args), root / "User")
+            self.assertIsNone(vpm.cli_context_issue(args))
+
+    def test_local_registration_resolves_names_without_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            user_dir = Path(tmp)
+            (user_dir / "profiles" / "abc123").mkdir(parents=True)
+            registry = write_local_profiles(
+                user_dir, [{"location": "abc123", "name": "Python"}]
+            )
+            original = registry.read_bytes()
+
+            profile, matched_by = vpm.resolve_profile_reference(user_dir, "Python")
+
+            self.assertEqual((profile["id"], matched_by), ("abc123", "name"))
+            self.assertEqual(profile["source"], "local-state")
+            self.assertEqual(registry.read_bytes(), original)
+
+    def test_local_registration_overrides_stale_sync_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            user_dir = Path(tmp)
+            (user_dir / "profiles" / "abc123").mkdir(parents=True)
+            write_profile_names(user_dir, [{"id": "abc123", "name": "Old name"}])
+            write_local_profiles(user_dir, [{"location": "abc123", "name": "New name"}])
+            self.assertEqual(
+                vpm.resolve_profile_reference(user_dir, "New name")[0]["id"], "abc123"
+            )
+            with self.assertRaisesRegex(vpm.VscodeProfileError, "not found"):
+                vpm.resolve_profile_reference(user_dir, "Old name")
+            write_local_profiles(user_dir, [])
+            self.assertIsNone(vpm.discover_profiles(user_dir)[0]["name"])
+
+    def test_legacy_local_uri_and_unsafe_locations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            user_dir = Path(tmp).resolve() / "User"
+            profile_dir = user_dir / "profiles" / "abc123"
+            profile_dir.mkdir(parents=True)
+            write_local_profiles(
+                user_dir,
+                [
+                    {
+                        "location": {"scheme": "file", "path": str(profile_dir)},
+                        "name": "Python",
+                    },
+                    {"location": "../outside", "name": "Unsafe"},
+                    {
+                        "location": {
+                            "scheme": "file",
+                            "path": str(user_dir.parent / "outside"),
+                        },
+                        "name": "Outside",
+                    },
+                ],
+            )
+            self.assertEqual(
+                vpm.resolve_profile_reference(user_dir, "Python")[0]["id"], "abc123"
+            )
+            self.assertEqual(len(vpm.discover_profiles(user_dir)), 1)
+
+    def test_unavailable_local_metadata_falls_back_to_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            user_dir = Path(tmp)
+            (user_dir / "profiles" / "abc123").mkdir(parents=True)
+            registry = write_local_profiles(user_dir, [])
+            registry.write_text("{invalid", encoding="utf-8")
+            write_profile_names(user_dir, [{"id": "abc123", "name": "Python"}])
+            self.assertEqual(
+                vpm.resolve_profile_reference(user_dir, "Python")[0]["source"],
+                "settings-sync",
+            )
+
     def test_profile_id_rejects_path_components_on_every_platform(self) -> None:
         for value in ("../outside", "..\\outside", "/absolute", "", ".", ".."):
             with self.subTest(value=value), self.assertRaises(vpm.VscodeProfileError):
@@ -226,6 +328,181 @@ class PathAndDiscoveryTests(unittest.TestCase):
 
 
 class DirectProfileTests(unittest.TestCase):
+    def test_shared_resources_resolve_to_default_and_snapshot_effective_content(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            user_dir, profile_dir = self.create_target(Path(tmp))
+            flags = {
+                key: True
+                for key in ("settings", "keybindings", "tasks", "snippets", "mcp")
+            }
+            write_local_profiles(
+                user_dir,
+                [{"location": "abc123", "name": "Python", "useDefaultFlags": flags}],
+            )
+            for filename, content in (
+                ("settings.json", '{"editor.fontSize":14}'),
+                ("keybindings.json", "[]"),
+                ("tasks.json", '{"version":"2.0.0","tasks":[]}'),
+                ("mcp.json", '{"servers":{}}'),
+            ):
+                (user_dir / filename).write_text(content, encoding="utf-8")
+            (user_dir / "snippets").mkdir()
+            (user_dir / "snippets" / "python.json").write_text("{}", encoding="utf-8")
+            (profile_dir / "settings.json").write_text(
+                '{"editor.fontSize":99}', encoding="utf-8"
+            )
+            profile, _ = vpm.resolve_profile_reference(user_dir, "Python")
+            for key, filename in (
+                ("settingsFile", "settings.json"),
+                ("keybindingsFile", "keybindings.json"),
+                ("tasksFile", "tasks.json"),
+                ("mcpFile", "mcp.json"),
+                ("snippetsDir", "snippets"),
+            ):
+                self.assertEqual(Path(profile[key]), user_dir / filename)
+            self.assertEqual(set(profile["sharedWithDefault"]), set(flags))
+            self.assertEqual(
+                vpm.snapshot_profile_files(profile)["settings.json"]["editor.fontSize"],
+                14,
+            )
+            archive, manifest = vpm.create_backup_archive(
+                base_args(),
+                user_dir,
+                Path(tmp) / "backups",
+                profile_id="abc123",
+                profile_name="Python",
+            )
+            self.assertEqual(set(manifest["sharedWithDefault"]), set(flags))
+            with zipfile.ZipFile(archive) as zf:
+                self.assertNotIn("settings.json", zf.namelist())
+
+    def test_shared_settings_edit_requires_explicit_scope_and_backs_up_default(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            user_dir, profile_dir = self.create_target(Path(tmp))
+            registry = write_local_profiles(
+                user_dir,
+                [
+                    {
+                        "location": "abc123",
+                        "name": "Python",
+                        "useDefaultFlags": {"settings": True},
+                    }
+                ],
+            )
+            registry_before = registry.read_bytes()
+            settings = user_dir / "settings.json"
+            settings.write_text('{"editor.fontSize":14}', encoding="utf-8")
+            args = base_args(
+                user_dir=str(user_dir),
+                profile="Python",
+                set_json='{"editor.fontSize":16}',
+                remove_key=[],
+                strategy="replace",
+            )
+            with self.assertRaisesRegex(
+                vpm.VscodeProfileError, "uses Default settings"
+            ):
+                vpm.command_merge_settings(args)
+            self.assertEqual(vpm.load_jsonc(settings)["editor.fontSize"], 14)
+            args.allow_shared_settings = True
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                vpm.command_merge_settings(args)
+            backup = Path(json.loads(output.getvalue())["backup"])
+            self.assertEqual(vpm.load_jsonc(backup)["editor.fontSize"], 14)
+            self.assertEqual(vpm.load_jsonc(settings)["editor.fontSize"], 16)
+            self.assertFalse((profile_dir / "settings.json").exists())
+            self.assertEqual(registry.read_bytes(), registry_before)
+
+    def test_merge_rejects_targets_outside_selected_user_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user_dir, profile_dir = self.create_target(root)
+            outside = root / "outside"
+            outside.mkdir()
+            settings = outside / "settings.json"
+            settings.write_text("{}", encoding="utf-8")
+            (user_dir / "profiles" / "linked").symlink_to(
+                outside, target_is_directory=True
+            )
+            (profile_dir / "settings.json").symlink_to(settings)
+            for profile, file in (
+                ("linked", None),
+                ("Python", None),
+                (None, str(settings)),
+            ):
+                args = base_args(
+                    user_dir=str(user_dir),
+                    profile=profile,
+                    file=file,
+                    set_json='{"changed":true}',
+                    remove_key=[],
+                    strategy="replace",
+                )
+                with (
+                    self.subTest(profile=profile),
+                    self.assertRaisesRegex(vpm.VscodeProfileError, "escapes"),
+                ):
+                    vpm.command_merge_settings(args)
+            self.assertEqual(settings.read_text(), "{}")
+            self.assertEqual(list(outside.iterdir()), [settings])
+
+    def test_open_profile_accepts_existing_workspace_files_and_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_file = Path(tmp) / "example.code-workspace"
+            workspace_file.write_text('{"folders":[]}', encoding="utf-8")
+            for path in (Path(tmp), workspace_file):
+                with (
+                    self.subTest(path=path),
+                    mock.patch.object(
+                        vpm.subprocess, "run", return_value=mock.Mock(returncode=0)
+                    ) as run,
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    vpm.command_open_profile(
+                        base_args(profile="Rust", workspace=str(path))
+                    )
+                self.assertEqual(run.call_args.args[0][1], str(path.resolve()))
+            missing = Path(tmp) / "missing"
+            with (
+                mock.patch.object(vpm.subprocess, "run") as run,
+                self.assertRaisesRegex(vpm.VscodeProfileError, "does not exist"),
+            ):
+                vpm.command_open_profile(
+                    base_args(profile="Rust", workspace=str(missing))
+                )
+            run.assert_not_called()
+            self.assertFalse(missing.exists())
+
+    def test_cli_merge_works_from_an_unrelated_working_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            user_dir, profile_dir = self.create_target(Path(tmp))
+            write_local_profiles(user_dir, [{"location": "abc123", "name": "Python"}])
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--user-dir",
+                    str(user_dir),
+                    "merge-settings",
+                    "--profile",
+                    "Python",
+                    "--set-json",
+                    '{"editor.formatOnSave":true}',
+                ],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(
+                vpm.load_jsonc(profile_dir / "settings.json")["editor.formatOnSave"]
+            )
+
     def create_target(self, root: Path, name: str = "Python") -> tuple[Path, Path]:
         user_dir = root / "User"
         profile_dir = user_dir / "profiles" / "abc123"
@@ -409,6 +686,90 @@ class DirectProfileTests(unittest.TestCase):
 
 
 class BackupRestoreTests(unittest.TestCase):
+    def test_restore_validates_all_payloads_before_preview_or_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user_dir = root / "User"
+            user_dir.mkdir()
+            settings = user_dir / "settings.json"
+            settings.write_text('{"value":"current"}', encoding="utf-8")
+            archive_path = root / "backup.zip"
+            manifest = {
+                "formatVersion": 1,
+                "variant": "code",
+                "scope": "default-profile",
+                "files": ["settings.json", "keybindings.json"],
+            }
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(vpm.BACKUP_MANIFEST_NAME, json.dumps(manifest))
+                archive.writestr("settings.json", '{"value":"restored"}')
+                archive.writestr("keybindings.json", "[ /*unterminated")
+            for confirm in (False, True):
+                args = base_args(
+                    user_dir=str(user_dir),
+                    archive=str(archive_path),
+                    confirm=confirm,
+                    allow_variant_mismatch=False,
+                    allow_profile_mismatch=False,
+                )
+                with (
+                    self.subTest(confirm=confirm),
+                    mock.patch.object(vpm, "create_backup_archive") as backup,
+                    self.assertRaisesRegex(
+                        vpm.VscodeProfileError, "Invalid JSON/JSONC"
+                    ),
+                ):
+                    vpm.command_restore(args)
+                backup.assert_not_called()
+                self.assertEqual(vpm.load_jsonc(settings), {"value": "current"})
+                self.assertFalse((user_dir / "keybindings.json").exists())
+
+    def test_restore_stops_on_backup_failure_but_allows_empty_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user_dir = root / "User"
+            user_dir.mkdir()
+            settings = user_dir / "settings.json"
+            settings.write_text('{"value":"current"}', encoding="utf-8")
+            archive_path = root / "backup.zip"
+            manifest = {
+                "formatVersion": 1,
+                "variant": "code",
+                "scope": "default-profile",
+                "files": ["settings.json"],
+            }
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(vpm.BACKUP_MANIFEST_NAME, json.dumps(manifest))
+                archive.writestr("settings.json", '{"value":"restored"}')
+            args = base_args(
+                user_dir=str(user_dir),
+                archive=str(archive_path),
+                confirm=True,
+                allow_variant_mismatch=False,
+                allow_profile_mismatch=False,
+            )
+            for error in (
+                vpm.VscodeProfileError("backup failed"),
+                OSError("disk full"),
+            ):
+                with (
+                    self.subTest(error=type(error).__name__),
+                    mock.patch.object(vpm, "create_backup_archive", side_effect=error),
+                    self.assertRaises(type(error)),
+                ):
+                    vpm.command_restore(args)
+                self.assertEqual(vpm.load_jsonc(settings), {"value": "current"})
+            settings.unlink()
+            output = io.StringIO()
+            with (
+                mock.patch.object(vpm, "create_backup_archive") as backup,
+                contextlib.redirect_stdout(output),
+            ):
+                vpm.command_restore(args)
+            backup.assert_not_called()
+            self.assertIsNone(json.loads(output.getvalue())["recoveryArchive"])
+            self.assertEqual(vpm.load_jsonc(settings), {"value": "restored"})
+
     def test_safe_backup_excludes_internal_state_and_includes_mcp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             user_dir = Path(tmp) / "User"
